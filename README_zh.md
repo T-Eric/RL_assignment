@@ -4,7 +4,7 @@
 
 训练面向无人机的视觉-语言导航（VLN）模型需要大量**多样化**的导航轨迹数据。在本次作业中，你需要实现一个强化学习智能体，在模拟城市环境中导航并采集同时满足**到达目标**和**路径多样**两个条件的轨迹。
 
-我们提供了一个基于点云的二维城市场景和 100 组起点-目标对。你的任务是为每组起点-目标对生成至少 20 条成功轨迹，并使整体多样性分数超过给定的 baseline。你可以自由选择任何 RL 算法、奖励函数设计或探索策略。
+我们提供了一个基于点云的二维城市场景和 20 组起点-目标对。你的任务是为每组起点-目标对生成至少 100 条成功轨迹，并使整体多样性分数超过给定的 baseline。你可以自由选择任何 RL 算法、奖励函数设计或探索策略。
 
 ## 动机
 
@@ -85,21 +85,21 @@ print(f"Point cloud: {pcd.shape}, Initials: {len(initials)}")
 
 2. **采集轨迹**：针对 `data/eval_initials_100.json` 中定义的 100 组起点-目标对，每组采集至少 **20 条成功轨迹**。
 
-3. **最大化轨迹多样性**：你的总体多样性分数（基于 DTW 计算，见下文）必须超过 baseline 分数 **2311.29**。
-
 ### 多样性指标
 
-多样性通过动态时间规整（DTW）距离衡量：
+提供多样性通过动态时间规整（DTW）距离衡量：
 
 1. 每条轨迹首先被**重采样**为均匀弧长间隔（间距 2√2 m）。这确保了分数不受原始轨迹时间分辨率的影响——无论你的智能体使用什么步长，评估时都会统一归一化。
-2. 对每组起点-目标对，计算所有 C(20, 2) = 190 条轨迹对的平均 DTW 距离。
-3. 总体分数为 100 组的平均值。
+2. 对每组起点-目标对，计算所有 C(100, 2) 条轨迹对的平均 DTW 距离。
+3. 总体分数为 20 组的平均值。
 
 官方评估代码在 `tools/compute_diversity.py` 中。**请勿修改此文件**——评分时将使用同一份代码。
 
+欢迎提出其他更好的指标！
+
 ### 评估起点
 
-`data/eval_initials_100.json` 中每条记录的格式：
+`data/eval_initials_20.json` 中每条记录的格式：
 
 ```json
 {
@@ -118,8 +118,8 @@ print(f"Point cloud: {pcd.shape}, Initials: {len(initials)}")
 
 ```
 data/
-  eval_initials_100.json     100 组评估起点-目标对
-  baseline_trajs/            Baseline 轨迹（100 × 20）
+  eval_initials_20.json     20 组评估起点-目标对
+  baseline_trajs/            Baseline 轨迹（20 × 100）
   baseline_diversity.json    Baseline 多样性分数及元信息
 
 tools/
@@ -145,7 +145,7 @@ submission/
   initial_1/
     ...
   ...
-  initial_99/
+  initial_20/
     ...
 ```
 
@@ -159,12 +159,12 @@ cd tools
 # 计算多样性分数
 python compute_diversity.py \
     --trajs_dir ../submission \
-    --initials_path ../data/eval_initials_100.json
+    --initials_path ../data/eval_initials_20.json
 
 # 完整检查（完整性 + 多样性 vs. baseline）
 python evaluate_submission.py \
     --submission_dir ../submission \
-    --initials_path ../data/eval_initials_100.json \
+    --initials_path ../data/eval_initials_20.json \
     --baseline_path ../data/baseline_diversity.json
 ```
 
@@ -174,8 +174,8 @@ python evaluate_submission.py \
 python tools/visualize_trajs.py \
     --pointcloud pointcloud_2d.npy \
     --trajs_dir submission \
-    --initials_path data/eval_initials_100.json \
-    --initial_ids 0 25 50 75 \
+    --initials_path data/eval_initials_20.json \
+    --initial_ids 0 5 10 15 \
     --output my_trajs.png
 ```
 
@@ -183,21 +183,13 @@ python tools/visualize_trajs.py \
 
 1. **源代码** — 完整实现，包括环境、RL 算法、训练脚本及所有工具代码。
 
-2. **轨迹数据** — 100 个目录，每个包含 20 个轨迹文件，格式如上所述。
+2. **轨迹数据** — 20 个目录，每个包含 100 个轨迹文件，格式如上所述。
 
 3. **报告**（PDF，3–5 页）—
    - 方法描述：算法选择、环境设计、奖励函数设计，以及你用于提升多样性的策略。
    - 训练分析：学习曲线和关键超参数。
    - 结果：多样性分数、与 baseline 的对比，以及至少 3 组起点-目标对的轨迹可视化。
 
-## 评分标准
-
-| 项目 | 权重 |
-|---|---|
-| 实现质量 | 20% |
-| 完整性（每组 20 条成功轨迹） | 30% |
-| 多样性超过 baseline | 30% |
-| 报告 | 20% |
 
 ## 附加题：视觉-语言-动作模型（+20%）
 
@@ -211,46 +203,3 @@ python tools/visualize_trajs.py \
 
 - [OpenFly Platform](https://github.com/SHAILAB-IPEC/OpenFly-Platform)
 - J. Schulman et al., "Proximal Policy Optimization Algorithms," arXiv:1707.06347, 2017.
-
----
-
-## 教师参考资料
-
-> **本节仅供教师使用，分发给学生前请删除。**
-
-`_instructor/` 目录包含可选的参考材料，由教师决定是否提供给学生：
-
-```
-_instructor/
-  cluster_centers.json     建筑中心坐标 {id: [cx, cy]}
-  pointcloud_2d.npy        预处理好的二维点云 (99993, 2) —
-                            如果学生在 CloudCompare 处理步骤遇到困难，可提供此文件
-
-  env/
-    uav_env.py             完整环境实现：
-                            - 点云加载与最近点查询
-                            - 4 维观测：[最近障碍物相对坐标, 目标相对坐标]
-                            - 基础奖励：距离进展 + 成功奖励 (+200)
-                              + 碰撞惩罚 (-100) + 步数代价 (-0.5)
-                            - 基于成功次数加权的自动重置采样
-    pointcloud_utils.py    点云加载与最近点查询工具
-
-  ppo/
-    ppo.py                 标准 PPO：裁剪代理目标 + 价值损失
-    storage.py             基于 dict 的 rollout 存储 + GAE
-
-  model.py                 策略网络：3 层 MLP (4→128) + actor/critic 头，
-                            连续动作通过 tanh 压缩的高斯分布输出
-
-  train.py                 训练入口：加载起点、运行 PPO 循环、
-                            按提交格式保存成功轨迹
-
-  vla_example.py           简化的 VLA 微调示例（Qwen2.5-VL + LoRA），
-                            包括 ActionTokenizer、数据格式化、collate 函数
-                            和 AirSim FPV 采集提示
-```
-
-**Baseline 统计：**
-- 多样性分数：**2311.29**（100 组 × 20 条轨迹的平均成对 DTW，重采样至 2√2 m 间隔）
-- 单组 DTW 范围：180 – 12977（中位数 1181）
-- 详见 `data/baseline_diversity.json`

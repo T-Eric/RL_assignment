@@ -37,7 +37,7 @@ def main():
                         help="Directory: initial_X/traj_Y.txt")
     parser.add_argument("--initials_path", required=True)
     parser.add_argument("--baseline_path", required=True)
-    parser.add_argument("--trajs_per_initial", type=int, default=20)
+    parser.add_argument("--trajs_per_initial", type=int, default=100)
     parser.add_argument("--success_radius", type=float, default=30.0)
     args = parser.parse_args()
 

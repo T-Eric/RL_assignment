@@ -3,10 +3,10 @@ Visualize trajectories on top of the 2D point cloud.
 
 Usage:
     python visualize_trajs.py \
-        --pointcloud ../data/pointcloud_2d.npy \
-        --trajs_dir ../data/baseline_trajs \
-        --initials_path ../data/eval_initials_100.json \
-        --initial_ids 0 25 50 75 \
+        --pointcloud ../src/pointcloud_2d.npy \
+        --trajs_dir ../submission_epvis \
+        --initials_path ../data/eval_initials_20.json \
+        --initial_ids 2 44 \
         --output visualization.png
 """
 
@@ -56,6 +56,11 @@ def visualize(pointcloud_path, trajs_dir, initials_path, initial_ids,
             if os.path.exists(traj_path):
                 traj = np.loadtxt(traj_path)
                 ax.plot(traj[:, 0], traj[:, 1], color=cmap[j],
+                        linewidth=0.8, alpha=0.7)
+            fail_files=[f for f in os.listdir(init_dir) if f.startswith("fail_traj_")]
+            for fail_file in fail_files:
+                fail_traj = np.loadtxt(os.path.join(init_dir, fail_file))
+                ax.plot(fail_traj[:, 0], fail_traj[:, 1], color="red",
                         linewidth=0.8, alpha=0.7)
 
         ax.plot(sx, sy, "go", markersize=8, label="Start")

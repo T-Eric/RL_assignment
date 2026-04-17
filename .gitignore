@@ -1,0 +1,5 @@
+data/
+.vscode/
+examples/
+saved_data/
+submission_*/

@@ -171,7 +171,7 @@ def main():
                         help="Directory with initial_X/traj_Y.txt files")
     parser.add_argument("--initials_path", required=True,
                         help="Path to eval_initials_100.json")
-    parser.add_argument("--trajs_per_initial", type=int, default=20)
+    parser.add_argument("--trajs_per_initial", type=int, default=100)
     parser.add_argument("--workers", type=int, default=None)
     args = parser.parse_args()
 

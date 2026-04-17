@@ -18,7 +18,7 @@ import gym
 import copy
 import torch
 import numpy as np
-from env.pointcloud_utils import load_pointcloud_transposed, find_nearest_point
+from .pointcloud_utils import load_pointcloud_transposed, find_nearest_point, build_pointcloud_index, find_nearest_point_kdtree
 
 
 class UAVNavEnv(gym.Env):
@@ -48,7 +48,8 @@ class UAVNavEnv(gym.Env):
 
         # Load point cloud: (2, N)
         print(f"Loading point cloud from {pointcloud_path}...")
-        self.all_points = load_pointcloud_transposed(pointcloud_path)
+        # self.all_points = load_pointcloud_transposed(pointcloud_path)
+        self.all_points, self.kd_tree = build_pointcloud_index(npy_path=pointcloud_path)
         print(f"Loaded {self.all_points.shape[1]} points")
 
         self.observation_shape = {"sensor": (4,)}
@@ -165,7 +166,7 @@ class UAVNavEnv(gym.Env):
     def _get_obs(self):
         xy = np.array([self.curr_pose[0], self.curr_pose[1]])
 
-        nearest_obs_rel, _ = find_nearest_point(self.all_points, xy)
+        nearest_obs_rel, _ = find_nearest_point_kdtree(self.all_points, self.kd_tree, xy)
         target_rel = self.target_center - xy
 
         sensor = np.concatenate([nearest_obs_rel, target_rel]).astype(np.float32)
