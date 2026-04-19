@@ -1,5 +1,5 @@
-data/
+data/baseline_trajs
 .vscode/
-examples/
 saved_data/
-submission_*/
+__pycache__/
+*.py[cod]

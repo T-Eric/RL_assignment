@@ -71,7 +71,7 @@ def parse_args():
     parser.add_argument("--use_episode_vis", action="store_true")
     parser.add_argument("--visit_bonus", type=float, default=1.0)
     parser.add_argument("--cell_repeat_penalty", type=float, default=0.1)
-
+    # historical rewards
     parser.add_argument("--use_history_vis", action="store_true")
     parser.add_argument("--global_history_bonus_coef",
                         type=float, default=0.3)
@@ -80,15 +80,32 @@ def parse_args():
     parser.add_argument("--use_soft_collision", action="store_true")
     parser.add_argument("--safe_distance", type=float, default=6.0)
     parser.add_argument("--safe_penalty_coef", type=float, default=0.1)
+    # goal-proximity relaxation / amplification
+    parser.add_argument("--goal_relax_outer_radius", type=float, default=80.0)
+    parser.add_argument("--goal_relax_inner_radius", type=float, default=40.0)
+    parser.add_argument("--goal_soft_collision_min_scale", type=float, default=0.25)
+    parser.add_argument("--goal_progress_max_scale", type=float, default=1.8)
 
     # biased destination
     parser.add_argument("--use_route_bias", action="store_true")
-    parser.add_argument("--route_bias_scale", type=float, default=40.0)
+    parser.add_argument("--route_bias_scale", type=float, default=20.0)
 
     parser.add_argument("--latent_dim", type=int, default=4)
     parser.add_argument("--disc_bonus_coef", type=float, default=5.0)
     parser.add_argument("--disc_loss_coef", type=float, default=1.0)
     parser.add_argument("--disc_lr", type=float, default=1e-4)
+    
+    # stuck-aware escape destination
+    parser.add_argument("--use_stuck_escape", action="store_true")
+    parser.add_argument("--escape_lookahead", type=float, default=12.0)
+
+    parser.add_argument("--stuck_window", type=int, default=12)
+    parser.add_argument("--stuck_progress_threshold", type=float, default=6.0)
+    parser.add_argument("--stuck_unique_ratio_threshold", type=float, default=0.35)
+
+    parser.add_argument("--escape_open_length", type=float, default=15.0)
+    parser.add_argument("--escape_open_weight", type=float, default=1.0)
+    parser.add_argument("--escape_goal_weight", type=float, default=0.8)
     return parser.parse_args()
 
 
@@ -145,9 +162,25 @@ def main():
         "use_soft_collision": args.use_soft_collision,
         "safe_distance": args.safe_distance,
         "safe_penalty_coef": args.safe_penalty_coef,
+        
+        "goal_relax_outer_radius": args.goal_relax_outer_radius,
+        "goal_relax_inner_radius": args.goal_relax_inner_radius,
+        "goal_soft_collision_min_scale": args.goal_soft_collision_min_scale,
+        "goal_progress_max_scale": args.goal_progress_max_scale,
 
         "use_route_bias": args.use_route_bias,
         "route_bias_scale": args.route_bias_scale,
+        
+        "use_stuck_escape": args.use_stuck_escape,
+        "escape_lookahead": args.escape_lookahead,
+
+        "stuck_window": args.stuck_window,
+        "stuck_progress_threshold": args.stuck_progress_threshold,
+        "stuck_unique_ratio_threshold": args.stuck_unique_ratio_threshold,
+
+        "escape_open_length": args.escape_open_length,
+        "escape_open_weight": args.escape_open_weight,
+        "escape_goal_weight": args.escape_goal_weight,
     }
     env = UAVNavEnv(
         pointcloud_path=args.pointcloud_path,
@@ -228,16 +261,19 @@ def main():
         for step in range(args.num_steps):
             with torch.no_grad():
                 value, action, action_log_prob = actor_critic.act(
-                    {k: rollouts.obs[k][step] for k in rollouts.obs})
+                    {k: rollouts.obs[k][step] for k in rollouts.obs}
+                )
 
             obs_next, reward, done, infos = env.step(action)
             traj.append([env.curr_pose[0], env.curr_pose[1]])
+
+            episode_return_for_log = None
 
             for info in infos:
                 if "episode" in info:
                     episode_return_for_log = info["episode"]["r"]
 
-                    # 1) optional discriminator update + terminal bonus
+                    # optional discriminator update + terminal bonus
                     if disc is not None and "episode_summary" in info and "latent_id" in info:
                         summary = torch.tensor(
                             info["episode_summary"], dtype=torch.float32, device=device
@@ -252,8 +288,7 @@ def main():
                         if info.get("won", False):
                             with torch.no_grad():
                                 log_probs = torch.log_softmax(logits, dim=-1)
-                                disc_bonus = args.disc_bonus_coef * \
-                                    log_probs[0, latent_id.item()]
+                                disc_bonus = args.disc_bonus_coef * log_probs[0, latent_id.item()]
                                 reward = reward + disc_bonus.view(1)
                             episode_return_for_log += disc_bonus.item()
                         else:
@@ -268,15 +303,14 @@ def main():
                         info["disc_loss"] = disc_loss.item()
                         info["disc_bonus"] = disc_bonus.item()
 
-                    # 2) logging reward
                     episode_rewards.append(episode_return_for_log)
 
-                    # 3) save successful trajectory
+                    # save successful trajectory
                     if info.get("won", False):
-                        n_success = len(os.listdir(
-                            os.path.join(args.save_dir, "success_trajs")))
+                        n_success = len(os.listdir(os.path.join(args.save_dir, "success_trajs")))
                         traj_path = os.path.join(
-                            args.save_dir, "success_trajs", f"{n_success}.txt")
+                            args.save_dir, "success_trajs", f"{n_success}.txt"
+                        )
                         with open(traj_path, "w") as f:
                             ip = info["initial_pose"]
                             tc = info["target_center"]
@@ -285,7 +319,7 @@ def main():
                             for px, py in traj:
                                 f.write(f"{px} {py}\n")
 
-                    # 4) manual reset
+                    # manual reset
                     env._sample_next_initial(info.get("won", False))
                     next_init = env.initials[env.initial_index]
 
@@ -293,15 +327,16 @@ def main():
                         next_init_id = next_init["initial_id"]
                         next_latent_id = latent_cursor_by_initial[next_init_id]
                         next_latent = sample_onehot_latent_with_id(
-                            args.latent_dim, next_latent_id)
+                            args.latent_dim, next_latent_id
+                        )
                         latent_cursor_by_initial[next_init_id] = (
-                            next_latent_id + 1) % args.latent_dim
+                            next_latent_id + 1
+                        ) % args.latent_dim
                     else:
                         next_latent = None
 
                     obs_next = env.reset(
-                        initial_pose=np.array(
-                            [next_init["x_start"], next_init["y_start"], 0.0]),
+                        initial_pose=np.array([next_init["x_start"], next_init["y_start"], 0.0]),
                         target_center=np.array([
                             next_init["target_center_x"],
                             next_init["target_center_y"],
@@ -312,16 +347,15 @@ def main():
 
                     traj = [[env.curr_pose[0], env.curr_pose[1]]]
 
-                masks = torch.FloatTensor([[0.0] if d else [1.0]
-                                        for d in done]).to(device)
-                bad_masks = torch.FloatTensor(
-                    [[0.0] if "bad_transition" in info else [1.0]
-                        for info in infos]
-                ).to(device)
-                rhs = torch.zeros(
-                    1, actor_critic.recurrent_hidden_state_size).to(device)
-                rollouts.insert(obs_next, rhs, action, action_log_prob,
-                                value, reward, masks, bad_masks)
+            masks = torch.FloatTensor([[0.0] if d else [1.0] for d in done]).to(device)
+            bad_masks = torch.FloatTensor(
+                [[0.0] if "bad_transition" in info else [1.0] for info in infos]
+            ).to(device)
+            rhs = torch.zeros(1, actor_critic.recurrent_hidden_state_size).to(device)
+
+            rollouts.insert(
+                obs_next, rhs, action, action_log_prob, value, reward, masks, bad_masks
+            )
 
         with torch.no_grad():
             next_value = actor_critic.get_value(

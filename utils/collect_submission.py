@@ -1,6 +1,5 @@
 import os
 import json
-import math
 import argparse
 import numpy as np
 import torch
@@ -25,20 +24,32 @@ def parse_args():
 
     parser.add_argument("--trajs_per_initial", type=int, default=100)
     parser.add_argument("--max_attempts_per_initial", type=int, default=10000)
-    parser.add_argument("--max_fail_save",type=int, default=100)
+    parser.add_argument("--max_fail_save", type=int, default=20)
 
-    # observation / visitation / latent params
+    # observation / reward / latent params
     parser.add_argument("--num_dirs", type=int, default=16)
     parser.add_argument("--max_obs_range", type=float, default=80.0)
     parser.add_argument("--cell_size", type=float, default=5.0)
+
     parser.add_argument("--use_episode_vis", action="store_true")
     parser.add_argument("--use_history_vis", action="store_true")
     parser.add_argument("--visit_bonus", type=float, default=1.0)
-    parser.add_argument("--cell_repeat_penalty", type=float, default=0.0)
-    parser.add_argument("--history_bonus_coef", type=float, default=0.0)
-    parser.add_argument("--latent_dim", type=int, default=0)
+    parser.add_argument("--cell_repeat_penalty", type=float, default=0.1)
 
-    # parallelism
+    parser.add_argument("--global_history_bonus_coef", type=float, default=0.1)
+    parser.add_argument("--latent_history_bonus_coef", type=float, default=0.2)
+
+    parser.add_argument("--use_soft_collision", action="store_true")
+    parser.add_argument("--safe_distance", type=float, default=4.0)
+    parser.add_argument("--safe_penalty_coef", type=float, default=0.02)
+
+    parser.add_argument("--use_route_bias", action="store_true")
+    parser.add_argument("--route_bias_scale", type=float, default=40.0)
+
+    parser.add_argument("--latent_dim", type=int, default=4)
+
+    # collection
+    parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=1)
 
@@ -57,7 +68,7 @@ def sample_onehot_latent(latent_dim, latent_id=None):
     if latent_id is None:
         idx = np.random.randint(latent_dim)
     else:
-        idx = latent_id
+        idx = int(latent_id) % latent_dim
     z[idx] = 1.0
     return z
 
@@ -68,18 +79,21 @@ def build_env_and_policy(args, device, initials):
         "success_radius": args["success_radius"],
         "collision_threshold": args["collision_threshold"],
         "action_limit": [args["action_limit"], args["action_limit"]],
-
         "num_dirs": args["num_dirs"],
         "max_obs_range": args["max_obs_range"],
-
         "cell_size": args["cell_size"],
         "use_episode_vis": args["use_episode_vis"],
         "use_history_vis": args["use_history_vis"],
         "visit_bonus": args["visit_bonus"],
         "cell_repeat_penalty": args["cell_repeat_penalty"],
-        "history_bonus_coef": args["history_bonus_coef"],
-
+        "global_history_bonus_coef": args["global_history_bonus_coef"],
+        "latent_history_bonus_coef": args["latent_history_bonus_coef"],
         "latent_dim": args["latent_dim"],
+        "use_soft_collision": args["use_soft_collision"],
+        "safe_distance": args["safe_distance"],
+        "safe_penalty_coef": args["safe_penalty_coef"],
+        "use_route_bias": args["use_route_bias"],
+        "route_bias_scale": args["route_bias_scale"],
     }
 
     env = UAVNavEnv(
@@ -91,11 +105,15 @@ def build_env_and_policy(args, device, initials):
     )
 
     obs_dim = env.observation_shape["sensor"][0]
+    latent_dim = env.observation_shape["latent"][0] if "latent" in env.observation_shape else 0
+
     actor_critic = Policy(
         obs_dim=obs_dim,
+        latent_dim=latent_dim,  # critical: must match training
         action_dim=2,
         action_limit=(args["action_limit"], args["action_limit"]),
     )
+
     ckpt = torch.load(args["checkpoint_path"], map_location=device)
     actor_critic.load_state_dict(ckpt)
     actor_critic.to(device)
@@ -159,23 +177,14 @@ def split_evenly(items, num_splits):
 
 
 def worker_collect(worker_rank, args_dict, init_subset):
-    # 每个 worker 自己设种子
     seed = args_dict["seed"] + worker_rank
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    # device 说明：
-    # 这里建议所有 worker 都用 CPU 做 rollout，避免多进程抢同一张 GPU 反而更慢
-    # 如果你坚持用 GPU，可把 use_cpu_for_collection 改成 False
-    use_cpu_for_collection = True
-    if use_cpu_for_collection:
-        device = torch.device("cpu")
-    else:
-        device = torch.device(
-            f"cuda:{args_dict['gpu']}" if torch.cuda.is_available() else "cpu"
-        )
+    # CPU collection is usually better for multi-process rollout.
+    device = torch.device("cpu")
 
     env, actor_critic = build_env_and_policy(args_dict, device, init_subset)
 
@@ -187,7 +196,7 @@ def worker_collect(worker_rank, args_dict, init_subset):
         os.makedirs(init_dir, exist_ok=True)
 
         success_count = 0
-        fail_count=0
+        fail_count = 0
         attempts = 0
 
         print(f"[worker {worker_rank}] initial_{iid}: target {args_dict['trajs_per_initial']}")
@@ -197,15 +206,15 @@ def worker_collect(worker_rank, args_dict, init_subset):
 
             latent = None
             if args_dict["latent_dim"] > 0:
-                # 轮流用不同 latent，比纯随机更稳
-                latent_id = success_count % args_dict["latent_dim"]
+                # cycle by attempts, not successes, so all latents get tried fairly
+                latent_id = (attempts - 1) % args_dict["latent_dim"]
                 latent = sample_onehot_latent(args_dict["latent_dim"], latent_id=latent_id)
 
             result = rollout_one_episode(
                 env=env,
                 actor_critic=actor_critic,
                 init_item=init_item,
-                deterministic=False,
+                deterministic=args_dict["deterministic"],
                 latent=latent,
             )
 
@@ -220,10 +229,9 @@ def worker_collect(worker_rank, args_dict, init_subset):
                         f"success={success_count}/{args_dict['trajs_per_initial']}, "
                         f"attempts={attempts}"
                     )
-                    
             else:
                 fail_count += 1
-                if fail_count < args_dict["max_fail_save"]:
+                if fail_count <= args_dict["max_fail_save"]:
                     traj_path = os.path.join(init_dir, f"fail_traj_{fail_count}.txt")
                     save_traj_txt(traj_path, result["traj"])
 
@@ -251,10 +259,8 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # ProcessPoolExecutor 需要可序列化对象，传 dict 最稳
     args_dict = vars(args).copy()
 
-    # 把 initial 均匀分给多个 worker
     num_workers = min(args.num_workers, len(initials))
     chunks = split_evenly(initials, num_workers)
 

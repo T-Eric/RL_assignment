@@ -1,0 +1,50 @@
+python src/train.py \
+  --pointcloud_path pointcloud_2d.npy \
+  --initials_path data/eval_initials_20.json \
+  --save_dir saved_data/latent_diverse_full_run_v2 \
+  --gpu 0 \
+  --max_iter 40000 \
+  --max_steps 300 \
+  --lr 5e-5 \
+  --gamma 0.99 \
+  --gae_lambda 0.95 \
+  --num_steps 256 \
+  --ppo_epoch 4 \
+  --num_mini_batch 4 \
+  --clip_param 0.1 \
+  --entropy_coef 0.02 \
+  --value_loss_coef 0.5 \
+  --max_grad_norm 0.5 \
+  --seed 1 \
+  --log_interval 10 \
+  --save_interval 2000 \
+  --num_dirs 16 \
+  --max_obs_range 80.0 \
+  --cell_size 5.0 \
+  --use_episode_vis \
+  --visit_bonus 1.0 \
+  --cell_repeat_penalty 0.15 \
+  --use_history_vis \
+  --global_history_bonus_coef 0.5 \
+  --latent_history_bonus_coef 0.5 \
+  --use_soft_collision \
+  --safe_distance 4.0 \
+  --safe_penalty_coef 0.02 \
+  --use_route_bias \
+  --route_bias_scale 20.0 \
+  --latent_dim 4 \
+  --disc_bonus_coef 5.0 \
+  --disc_loss_coef 1.0 \
+  --disc_lr 1e-4 \
+  --goal_relax_outer_radius 80.0 \
+  --goal_relax_inner_radius 40.0 \
+  --goal_soft_collision_min_scale 0.25 \
+  --goal_progress_max_scale 1.8 \
+  --use_stuck_escape \
+  --escape_lookahead 12.0 \
+  --stuck_window 12 \
+  --stuck_progress_threshold 6.0 \
+  --stuck_unique_ratio_threshold 0.35 \
+  --escape_open_length 15.0 \
+  --escape_open_weight 1.0 \
+  --escape_goal_weight 0.8
