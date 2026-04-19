@@ -19,15 +19,25 @@ import torch
 from env.uav_env import UAVNavEnv
 from ppo.ppo import PPO
 from ppo.storage import DictRolloutStorage
-from model import Policy
+from model import Policy, LatentDiscriminator
 
 # episode_level utils
+
+
 def sample_onehot_latent(latent_dim):
     if latent_dim <= 0:
         return None
     z = np.zeros(latent_dim, dtype=np.float32)
     idx = np.random.randint(latent_dim)
     z[idx] = 1.0
+    return z
+
+def sample_onehot_latent_with_id(latent_dim, latent_id):
+    # fixed latent
+    if latent_dim <= 0:
+        return None
+    z = np.zeros(latent_dim, dtype=np.float32)
+    z[latent_id] = 1.0
     return z
 
 
@@ -53,23 +63,34 @@ def parse_args():
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=5000)
     parser.add_argument("--gpu", type=int, default=0)
-    
+
     parser.add_argument("--num_dirs", type=int, default=16)
     parser.add_argument("--max_obs_range", type=float, default=80.0)
     # visitation rewards
     parser.add_argument("--cell_size", type=float, default=5.0)
     parser.add_argument("--use_episode_vis", action="store_true")
-    parser.add_argument("--use_history_vis", action="store_true")
     parser.add_argument("--visit_bonus", type=float, default=1.0)
     parser.add_argument("--cell_repeat_penalty", type=float, default=0.1)
-    parser.add_argument("--history_bonus_coef", type=float, default=0.5)
-    
+
+    parser.add_argument("--use_history_vis", action="store_true")
+    parser.add_argument("--global_history_bonus_coef",
+                        type=float, default=0.3)
+    parser.add_argument("--latent_history_bonus_coef", type=float, default=0.5)
+
     parser.add_argument("--use_soft_collision", action="store_true")
     parser.add_argument("--safe_distance", type=float, default=6.0)
     parser.add_argument("--safe_penalty_coef", type=float, default=0.1)
-    
+
+    # biased destination
+    parser.add_argument("--use_route_bias", action="store_true")
+    parser.add_argument("--route_bias_scale", type=float, default=40.0)
+
     parser.add_argument("--latent_dim", type=int, default=4)
+    parser.add_argument("--disc_bonus_coef", type=float, default=5.0)
+    parser.add_argument("--disc_loss_coef", type=float, default=1.0)
+    parser.add_argument("--disc_lr", type=float, default=1e-4)
     return parser.parse_args()
+
 
 def main():
     args = parse_args()
@@ -79,12 +100,16 @@ def main():
     np.random.seed(args.seed)
     torch.set_num_threads(1)
 
-    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
 
     # Load initials
     with open(args.initials_path) as f:
         initials = json.load(f)
     print(f"Loaded {len(initials)} initials")
+    latent_cursor_by_initial = {
+        init["initial_id"]: 0 for init in initials
+    }
 
     # Experiment directory
     if args.save_dir is None:
@@ -102,22 +127,27 @@ def main():
         "success_radius": 30.0,
         "collision_threshold": 2.0,
         "action_limit": [2.0, 2.0],
-        
+
         "num_dirs": args.num_dirs,
         "max_obs_range": args.max_obs_range,
 
         "cell_size": args.cell_size,
         "use_episode_vis": args.use_episode_vis,
-        "use_history_vis": args.use_history_vis,
         "visit_bonus": args.visit_bonus,
         "cell_repeat_penalty": args.cell_repeat_penalty,
-        "history_bonus_coef": args.history_bonus_coef,
-        
+
+        "use_history_vis": args.use_history_vis,
+        "global_history_bonus_coef": args.global_history_bonus_coef,
+        "latent_history_bonus_coef": args.latent_history_bonus_coef,
+
         "latent_dim": args.latent_dim,
-        
+
         "use_soft_collision": args.use_soft_collision,
         "safe_distance": args.safe_distance,
         "safe_penalty_coef": args.safe_penalty_coef,
+
+        "use_route_bias": args.use_route_bias,
+        "route_bias_scale": args.route_bias_scale,
     }
     env = UAVNavEnv(
         pointcloud_path=args.pointcloud_path,
@@ -128,9 +158,27 @@ def main():
     )
 
     # Create policy and PPO agent
-    obs_dim=env.observation_shape["sensor"][0]
-    actor_critic = Policy(obs_dim=obs_dim, action_dim=2, action_limit=(2.0, 2.0))
+    obs_dim = env.observation_shape["sensor"][0]
+    latent_dim = env.observation_shape["latent"][0] if "latent" in env.observation_shape else 0
+
+    actor_critic = Policy(
+        obs_dim=obs_dim,
+        latent_dim=latent_dim,
+        action_dim=2,
+        action_limit=(2.0, 2.0),
+    )
     actor_critic.to(device)
+
+    latent_dim = env.observation_shape["latent"][0] if "latent" in env.observation_shape else 0
+
+    # Discriminator for latent space regularization
+    disc = None
+    disc_optimizer = None
+    if latent_dim > 1:
+        summary_dim = 9
+        disc = LatentDiscriminator(
+            summary_dim=summary_dim, latent_dim=latent_dim).to(device)
+        disc_optimizer = torch.optim.Adam(disc.parameters(), lr=args.disc_lr)
 
     agent = PPO(
         actor_critic, args.clip_param, args.ppo_epoch, args.num_mini_batch,
@@ -146,10 +194,19 @@ def main():
 
     # Initial reset
     init0 = initials[0]
-    latent0=sample_onehot_latent(args.latent_dim)
+    # latent0 = sample_onehot_latent(args.latent_dim)
+    if args.latent_dim > 0:
+        init0_id = init0["initial_id"]
+        latent0_id = latent_cursor_by_initial[init0_id]
+        latent0 = sample_onehot_latent_with_id(args.latent_dim, latent0_id)
+        latent_cursor_by_initial[init0_id] = (latent0_id + 1) % args.latent_dim
+    else:
+        latent0 = None
+        
     obs = env.reset(
         initial_pose=np.array([init0["x_start"], init0["y_start"], 0.0]),
-        target_center=np.array([init0["target_center_x"], init0["target_center_y"]]),
+        target_center=np.array(
+            [init0["target_center_x"], init0["target_center_y"]]),
         initial_id=init0["initial_id"],
         latent=latent0,
     )
@@ -178,8 +235,43 @@ def main():
 
             for info in infos:
                 if "episode" in info:
-                    episode_rewards.append(info["episode"]["r"])
+                    episode_return_for_log = info["episode"]["r"]
 
+                    # 1) optional discriminator update + terminal bonus
+                    if disc is not None and "episode_summary" in info and "latent_id" in info:
+                        summary = torch.tensor(
+                            info["episode_summary"], dtype=torch.float32, device=device
+                        ).unsqueeze(0)
+
+                        latent_id = torch.tensor(
+                            [info["latent_id"]], dtype=torch.long, device=device
+                        )
+
+                        logits = disc(summary)
+
+                        if info.get("won", False):
+                            with torch.no_grad():
+                                log_probs = torch.log_softmax(logits, dim=-1)
+                                disc_bonus = args.disc_bonus_coef * \
+                                    log_probs[0, latent_id.item()]
+                                reward = reward + disc_bonus.view(1)
+                            episode_return_for_log += disc_bonus.item()
+                        else:
+                            disc_bonus = torch.tensor(0.0, device=device)
+
+                        disc_loss = torch.nn.functional.cross_entropy(logits, latent_id)
+
+                        disc_optimizer.zero_grad()
+                        (args.disc_loss_coef * disc_loss).backward()
+                        disc_optimizer.step()
+
+                        info["disc_loss"] = disc_loss.item()
+                        info["disc_bonus"] = disc_bonus.item()
+
+                    # 2) logging reward
+                    episode_rewards.append(episode_return_for_log)
+
+                    # 3) save successful trajectory
                     if info.get("won", False):
                         n_success = len(os.listdir(
                             os.path.join(args.save_dir, "success_trajs")))
@@ -192,17 +284,24 @@ def main():
                             f.write(f"{tc[0]} {tc[1]}\n")
                             for px, py in traj:
                                 f.write(f"{px} {py}\n")
-                                
-                    # manual reset
+
+                    # 4) manual reset
                     env._sample_next_initial(info.get("won", False))
                     next_init = env.initials[env.initial_index]
-                    next_latent=sample_onehot_latent(args.latent_dim)
+
+                    if args.latent_dim > 0:
+                        next_init_id = next_init["initial_id"]
+                        next_latent_id = latent_cursor_by_initial[next_init_id]
+                        next_latent = sample_onehot_latent_with_id(
+                            args.latent_dim, next_latent_id)
+                        latent_cursor_by_initial[next_init_id] = (
+                            next_latent_id + 1) % args.latent_dim
+                    else:
+                        next_latent = None
+
                     obs_next = env.reset(
-                        initial_pose=np.array([
-                            next_init["x_start"],
-                            next_init["y_start"],
-                            0.0
-                        ]),
+                        initial_pose=np.array(
+                            [next_init["x_start"], next_init["y_start"], 0.0]),
                         target_center=np.array([
                             next_init["target_center_x"],
                             next_init["target_center_y"],
@@ -210,15 +309,19 @@ def main():
                         initial_id=next_init["initial_id"],
                         latent=next_latent,
                     )
-                
+
                     traj = [[env.curr_pose[0], env.curr_pose[1]]]
 
-            masks = torch.FloatTensor([[0.0] if d else [1.0] for d in done]).to(device)
-            bad_masks = torch.FloatTensor(
-                [[0.0] if "bad_transition" in info else [1.0] for info in infos]
-            ).to(device)
-            rhs = torch.zeros(1, actor_critic.recurrent_hidden_state_size).to(device)
-            rollouts.insert(obs_next, rhs, action, action_log_prob, value, reward, masks, bad_masks)
+                masks = torch.FloatTensor([[0.0] if d else [1.0]
+                                        for d in done]).to(device)
+                bad_masks = torch.FloatTensor(
+                    [[0.0] if "bad_transition" in info else [1.0]
+                        for info in infos]
+                ).to(device)
+                rhs = torch.zeros(
+                    1, actor_critic.recurrent_hidden_state_size).to(device)
+                rollouts.insert(obs_next, rhs, action, action_log_prob,
+                                value, reward, masks, bad_masks)
 
         with torch.no_grad():
             next_value = actor_critic.get_value(
@@ -231,7 +334,8 @@ def main():
         if j % args.log_interval == 0 and len(episode_rewards) > 0:
             elapsed = time.time() - start_time
             total_steps = (j + 1) * args.num_steps
-            n_success = len(os.listdir(os.path.join(args.save_dir, "success_trajs")))
+            n_success = len(os.listdir(
+                os.path.join(args.save_dir, "success_trajs")))
             print(f"[Iter {j:6d}] steps={total_steps:8d}  "
                   f"reward={np.mean(episode_rewards):7.1f}  "
                   f"success_trajs={n_success}  "
