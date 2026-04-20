@@ -63,6 +63,29 @@ class UAVNavEnv(gym.Env):
             "global_history_bonus_coef", 0.0)
         self.latent_history_bonus_coef = params.get(
             "latent_history_bonus_coef", 0.0)
+        
+        # --------------------------------------------------
+        # position-aware history weighting
+        # --------------------------------------------------
+        self.history_decay_beta = params.get("history_decay_beta", 0.5)
+
+        # distance-based suppression near start / goal
+        self.history_start_relax_radius = params.get("history_start_relax_radius", 45.0)
+        self.history_goal_relax_radius = params.get("history_goal_relax_radius", 45.0)
+
+        # whether to use latent pseudo goal for latent-specific history weighting
+        self.use_latent_pseudo_goal = params.get("use_latent_pseudo_goal", True)
+        self.latent_goal_shift_scale = params.get("latent_goal_shift_scale", 35.0)
+
+        # inter-latent overlap repulsion
+        self.use_inter_latent_repulsion = params.get("use_inter_latent_repulsion", False)
+        self.inter_latent_repulsion_coef = params.get("inter_latent_repulsion_coef", 0.0)
+
+        # failure trajectory weighted history update
+        self.failure_history_weight = params.get("failure_history_weight", 0.0)
+
+        # optional cap for position weight (normally 1.0)
+        self.history_pos_weight_cap = params.get("history_pos_weight_cap", 1.0)
 
         # latent z
         self.latent_dim = params.get("latent_dim", 4)
@@ -323,17 +346,43 @@ class UAVNavEnv(gym.Env):
         # historical coverage reward
         history_reward = 0.0
         if self.use_history_vis and self.curr_initial_id is not None:
-            # global per-initial history reward
-            global_map = self.global_coverage_maps[self.curr_initial_id]
-            global_count = global_map.get(curr_cell, 0)
-            history_reward += self.global_history_bonus_coef / np.sqrt(1.0 + global_count)
+            latent_id = self._get_latent_id()
 
-            # latent-specific per-initial history reward
-            if self.curr_latent is not None:
-                latent_id = int(np.argmax(self.curr_latent))
+            # ---------- global per-initial history ----------
+            global_map = self.global_coverage_maps[self.curr_initial_id]
+            global_count = global_map.get(curr_cell, 0.0)
+            w_global = self._compute_history_position_weight(
+                curr_cell, use_latent_goal=False
+            )
+            history_reward += (
+                w_global
+                * self.global_history_bonus_coef
+                * self._history_novelty(global_count)
+            )
+
+            # ---------- latent-specific per-initial history ----------
+            if latent_id is not None:
                 latent_map = self.latent_coverage_maps[self.curr_initial_id][latent_id]
-                latent_count = latent_map.get(curr_cell, 0)
-                history_reward += self.latent_history_bonus_coef / np.sqrt(1.0 + latent_count)
+                latent_count = latent_map.get(curr_cell, 0.0)
+                w_latent = self._compute_history_position_weight(
+                    curr_cell, use_latent_goal=True
+                )
+                history_reward += (
+                    w_latent
+                    * self.latent_history_bonus_coef
+                    * self._history_novelty(latent_count)
+                )
+
+                # ---------- inter-latent repulsion ----------
+                if self.use_inter_latent_repulsion and self.inter_latent_repulsion_coef > 0.0:
+                    other_latent_count = self._get_other_latent_overlap_count(
+                        self.curr_initial_id, curr_cell, latent_id
+                    )
+                    history_reward -= (
+                        w_latent
+                        * self.inter_latent_repulsion_coef
+                        * np.log(1.0 + other_latent_count)
+                    )
 
         self._prev_target_dist = target_dist
 
@@ -373,18 +422,34 @@ class UAVNavEnv(gym.Env):
             if self.curr_latent is not None:
                 info["latent_id"] = int(np.argmax(self.curr_latent))
 
-            if info.get("won", False):
+            # if info.get("won", False):
+            #     # 1) update global per-initial map
+            #     global_map = self.global_coverage_maps[self.curr_initial_id]
+            #     for cell in self.visited_cells_ep:
+            #         global_map[cell] = global_map.get(cell, 0) + 1
+
+            #     # 2) update latent-specific per-initial map
+            #     if self.curr_latent is not None:
+            #         latent_id = int(np.argmax(self.curr_latent))
+            #         latent_map = self.latent_coverage_maps[self.curr_initial_id][latent_id]
+            #         for cell in self.visited_cells_ep:
+            #             latent_map[cell] = latent_map.get(cell, 0) + 1
+            
+            # TODO CAUTION! Now failure trajs also count
+            update_weight = 1.0 if info.get("won", False) else self.failure_history_weight
+
+            if update_weight > 0.0 and self.curr_initial_id is not None:
                 # 1) update global per-initial map
                 global_map = self.global_coverage_maps[self.curr_initial_id]
                 for cell in self.visited_cells_ep:
-                    global_map[cell] = global_map.get(cell, 0) + 1
+                    global_map[cell] = global_map.get(cell, 0.0) + update_weight
 
                 # 2) update latent-specific per-initial map
-                if self.curr_latent is not None:
-                    latent_id = int(np.argmax(self.curr_latent))
+                latent_id = self._get_latent_id()
+                if latent_id is not None:
                     latent_map = self.latent_coverage_maps[self.curr_initial_id][latent_id]
                     for cell in self.visited_cells_ep:
-                        latent_map[cell] = latent_map.get(cell, 0) + 1
+                        latent_map[cell] = latent_map.get(cell, 0.0) + update_weight
 
         return obs, torch.tensor([reward], device=self.device), [done], [info]
 
@@ -422,6 +487,12 @@ class UAVNavEnv(gym.Env):
                 directional_dists=directional_dists,
                 target_rel=true_target_rel,
             )
+            
+            # robust fallback
+            if escape_dir is None:
+                escape_dir = np.array([0.0, 0.0], dtype=np.float32)
+            else:
+                escape_dir = np.asarray(escape_dir, dtype=np.float32)
 
             # replace observation target with a local escape destination
             escape_target = xy + self.escape_lookahead * escape_dir
@@ -560,3 +631,71 @@ class UAVNavEnv(gym.Env):
                 best_vec = u
 
         return best_vec
+    
+    # ------
+    # dynamic history utils
+    # ------
+    def _cell_to_center_xy(self, cell):
+        cx, cy = cell
+        x = (cx + 0.5) * self.cell_size
+        y = (cy + 0.5) * self.cell_size
+        return np.array([x, y], dtype=np.float64)
+
+    def _get_latent_id(self):
+        if self.curr_latent is None:
+            return None
+        return int(np.argmax(self.curr_latent))
+
+    def _get_latent_pseudo_goal(self):
+        """
+        Build a pseudo goal for latent-conditioned mid-route weighting.
+        """
+        if (not self.use_latent_pseudo_goal) or (self.curr_latent is None) or (self.route_bias_table is None):
+            return self.target_center
+
+        latent_id = self._get_latent_id()
+        bias_dir = self.route_bias_table[latent_id].astype(np.float64)
+        return self.target_center + self.latent_goal_shift_scale * bias_dir
+
+    def _compute_history_position_weight(self, cell, use_latent_goal=False):
+        """
+        Larger in the middle of the route, smaller near start / goal.
+        """
+        cell_xy = self._cell_to_center_xy(cell)
+        start_xy = np.array([self.initial_pose[0], self.initial_pose[1]], dtype=np.float64)
+
+        if use_latent_goal:
+            goal_xy = self._get_latent_pseudo_goal().astype(np.float64)
+        else:
+            goal_xy = self.target_center.astype(np.float64)
+
+        d_start = np.linalg.norm(cell_xy - start_xy)
+        d_goal = np.linalg.norm(cell_xy - goal_xy)
+
+        w_start = min(d_start / self.history_start_relax_radius, 1.0)
+        w_goal = min(d_goal / self.history_goal_relax_radius, 1.0)
+
+        w = min(w_start, w_goal)
+        w = min(w, self.history_pos_weight_cap)
+        return float(w)
+
+    def _history_novelty(self, count):
+        """
+        Decaying novelty reward.
+        """
+        return 1.0 / ((1.0 + count) ** self.history_decay_beta)
+
+    def _get_other_latent_overlap_count(self, initial_id, cell, curr_latent_id):
+        """
+        Sum of successful visitation counts from other latents on this cell.
+        """
+        if self.latent_dim <= 0 or curr_latent_id is None:
+            return 0.0
+
+        total = 0.0
+        latent_maps = self.latent_coverage_maps[initial_id]
+        for z, z_map in latent_maps.items():
+            if z == curr_latent_id:
+                continue
+            total += z_map.get(cell, 0.0)
+        return total

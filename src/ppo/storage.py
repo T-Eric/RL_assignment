@@ -26,6 +26,7 @@ class DictRolloutStorage:
         self.masks = torch.ones(num_steps + 1, num_processes, 1)
         self.bad_masks = torch.ones(num_steps + 1, num_processes, 1)
         self.num_steps = num_steps
+        self.num_processes = num_processes
         self.step = 0
 
     def to(self, device):
@@ -66,9 +67,11 @@ class DictRolloutStorage:
             self.value_preds[-1] = next_value
             gae = 0
             for step in reversed(range(self.rewards.size(0))):
-                delta = (self.rewards[step]
-                         + gamma * self.value_preds[step + 1] * self.masks[step + 1]
-                         - self.value_preds[step])
+                delta = (
+                    self.rewards[step]
+                    + gamma * self.value_preds[step + 1] * self.masks[step + 1]
+                    - self.value_preds[step]
+                )
                 gae = delta + gamma * gae_lambda * self.masks[step + 1] * gae
                 if use_proper_time_limits:
                     gae = gae * self.bad_masks[step + 1]
@@ -78,7 +81,8 @@ class DictRolloutStorage:
             for step in reversed(range(self.rewards.size(0))):
                 self.returns[step] = (
                     self.returns[step + 1] * gamma * self.masks[step + 1]
-                    + self.rewards[step])
+                    + self.rewards[step]
+                )
 
     def feed_forward_generator(self, advantages, num_mini_batch=None,
                                mini_batch_size=None):
@@ -86,25 +90,39 @@ class DictRolloutStorage:
         batch_size = num_processes * num_steps
 
         if mini_batch_size is None:
+            if num_mini_batch is None:
+                raise ValueError("Either mini_batch_size or num_mini_batch must be provided.")
             mini_batch_size = batch_size // num_mini_batch
 
-        sampler = BatchSampler(SubsetRandomSampler(range(batch_size)),
-                               mini_batch_size, drop_last=True)
+        sampler = BatchSampler(
+            SubsetRandomSampler(range(batch_size)),
+            mini_batch_size,
+            drop_last=True,
+        )
 
         for indices in sampler:
             obs_batch = {}
             for key in self.obs_keys:
-                flat = self.obs[key][:-1].view(-1, *self.obs[key].size()[2:])
+                flat = self.obs[key][:-1].reshape(batch_size, *self.obs[key].size()[2:])
                 obs_batch[key] = flat[indices]
 
-            rhs_batch = self.recurrent_hidden_states[:-1].view(
-                -1, self.recurrent_hidden_states.size(-1))[indices]
-            actions_batch = self.actions.view(-1, self.actions.size(-1))[indices]
-            value_preds_batch = self.value_preds[:-1].view(-1, 1)[indices]
-            return_batch = self.returns[:-1].view(-1, 1)[indices]
-            masks_batch = self.masks[:-1].view(-1, 1)[indices]
-            old_action_log_probs_batch = self.action_log_probs.view(-1, 1)[indices]
-            adv_targ = advantages.view(-1, 1)[indices] if advantages is not None else None
+            rhs_batch = self.recurrent_hidden_states[:-1].reshape(
+                batch_size, self.recurrent_hidden_states.size(-1)
+            )[indices]
+            actions_batch = self.actions.reshape(batch_size, *self.actions.size()[2:])[indices]
+            value_preds_batch = self.value_preds[:-1].reshape(batch_size, 1)[indices]
+            return_batch = self.returns[:-1].reshape(batch_size, 1)[indices]
+            masks_batch = self.masks[:-1].reshape(batch_size, 1)[indices]
+            old_action_log_probs_batch = self.action_log_probs.reshape(batch_size, 1)[indices]
+            adv_targ = advantages.reshape(batch_size, 1)[indices] if advantages is not None else None
 
-            yield (obs_batch, rhs_batch, actions_batch, value_preds_batch,
-                   return_batch, masks_batch, old_action_log_probs_batch, adv_targ)
+            yield (
+                obs_batch,
+                rhs_batch,
+                actions_batch,
+                value_preds_batch,
+                return_batch,
+                masks_batch,
+                old_action_log_probs_batch,
+                adv_targ,
+            )

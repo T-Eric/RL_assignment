@@ -76,9 +76,38 @@ def parse_args():
     parser.add_argument("--open_excursion_length", type=float, default=18.0)
     parser.add_argument("--open_excursion_max_steps", type=int, default=12)
     parser.add_argument("--open_excursion_abort_obstacle_dist", type=float, default=3.0)
+    
+    parser.add_argument("--open_excursion_subgoal_radius", type=float, default=10.0)
+    parser.add_argument("--open_excursion_rect_margin", type=float, default=5.0)
 
     return parser.parse_args()
 
+def sample_point_inside_rect(rect, margin=10.0):
+    """
+    Sample a point strictly inside an open rect, leaving some margin from boundaries.
+    """
+    xmin = rect["xmin"] + margin
+    xmax = rect["xmax"] - margin
+    ymin = rect["ymin"] + margin
+    ymax = rect["ymax"] - margin
+
+    # fallback if rect is too small for the requested margin
+    if xmax <= xmin:
+        xmin = rect["xmin"]
+        xmax = rect["xmax"]
+    if ymax <= ymin:
+        ymin = rect["ymin"]
+        ymax = rect["ymax"]
+
+    x = np.random.uniform(xmin, xmax)
+    y = np.random.uniform(ymin, ymax)
+    return np.array([x, y], dtype=np.float64)
+
+def get_current_open_rect(xy, rects):
+    for rect in rects:
+        if point_in_rect(xy, rect):
+            return rect
+    return None
 
 def save_traj_txt(path, traj):
     arr = np.asarray(traj, dtype=np.float64)
@@ -288,9 +317,11 @@ def rollout_one_episode(
     use_open_excursion=False,
     open_excursion_trigger_prob=0.2,
     open_excursion_min_target_dist=60.0,
-    open_excursion_length=18.0,
+    open_excursion_length=18.0,   # 保留兼容，但强制子目标模式不再依赖它
     open_excursion_max_steps=12,
     open_excursion_abort_obstacle_dist=3.0,
+    open_excursion_subgoal_radius=15.0,
+    open_excursion_rect_margin=10.0,
     use_route_bias=False,
     use_stuck_escape=False,
 ):
@@ -326,11 +357,14 @@ def rollout_one_episode(
         target_dist = np.linalg.norm(true_target_rel)
 
         # detect current rect
+        current_rect = None
         current_rect_id = None
         if use_open_excursion and open_rects:
-            current_rect_id = get_current_open_rect_id(curr_xy, open_rects)
+            current_rect = get_current_open_rect(curr_xy, open_rects)
+            if current_rect is not None:
+                current_rect_id = current_rect["region_id"]
 
-        # possibly trigger a new excursion
+        # trigger a new rect-subgoal excursion
         if (
             use_open_excursion
             and (not excursion_active)
@@ -339,8 +373,10 @@ def rollout_one_episode(
             and (target_dist > open_excursion_min_target_dist)
             and (np.random.rand() < open_excursion_trigger_prob)
         ):
-            exc_dir = sample_excursion_direction(true_target_rel, latent=latent)
-            excursion_target = curr_xy + open_excursion_length * exc_dir
+            excursion_target = sample_point_inside_rect(
+                current_rect,
+                margin=open_excursion_rect_margin,
+            )
             excursion_active = True
             excursion_steps = 0
             triggered_rects.add(current_rect_id)
@@ -382,7 +418,7 @@ def rollout_one_episode(
             obstacle_dist = np.linalg.norm(nearest_obs_rel)
 
             if (
-                excursion_dist < 5.0
+                excursion_dist < open_excursion_subgoal_radius
                 or obstacle_dist < open_excursion_abort_obstacle_dist
                 or excursion_steps >= open_excursion_max_steps
             ):
@@ -458,6 +494,8 @@ def worker_collect(worker_rank, args_dict, init_subset):
                 open_excursion_abort_obstacle_dist=args_dict["open_excursion_abort_obstacle_dist"],
                 use_route_bias=args_dict["use_route_bias"],
                 use_stuck_escape=args_dict["use_stuck_escape"],
+                open_excursion_subgoal_radius=args_dict["open_excursion_subgoal_radius"],
+                open_excursion_rect_margin=args_dict["open_excursion_rect_margin"],
             )
 
             if result["won"]:

@@ -7,7 +7,8 @@ This script:
 3. optionally erodes the mask to remove thin/uncertain boundary parts
 4. repeatedly extracts the largest all-ones axis-aligned rectangle
 5. removes that rectangle from the mask
-6. saves rectangles to json and renders a visualization
+6. appends manually specified open rectangles
+7. saves rectangles to json and renders a visualization
 
 Usage example:
     python tools/build_open_rect.py \
@@ -25,15 +26,56 @@ Usage example:
 
 import argparse
 import json
-import math
-import os
-from typing import List, Tuple, Dict, Optional
+from typing import List, Dict
 
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+
+
+# ============================================================
+# Manual open-rectangle container
+# Edit this list in the future if you want more hard-coded areas.
+# Each item is [xmin, xmax, ymin, ymax].
+# ============================================================
+MANUAL_OPEN_RECTS = [
+    [-1300.0, -1205.0, -550.0, 50.0],
+]
+
+
+def make_manual_rect(xmin: float, xmax: float, ymin: float, ymax: float, region_id=None) -> Dict:
+    """
+    Build a full rectangle entry from four coordinates.
+    """
+    xmin = float(xmin)
+    xmax = float(xmax)
+    ymin = float(ymin)
+    ymax = float(ymax)
+
+    if xmax <= xmin:
+        raise ValueError(f"Invalid manual rect: xmax <= xmin ({xmax} <= {xmin})")
+    if ymax <= ymin:
+        raise ValueError(f"Invalid manual rect: ymax <= ymin ({ymax} <= {ymin})")
+
+    width = xmax - xmin
+    height = ymax - ymin
+
+    return {
+        "xmin": xmin,
+        "xmax": xmax,
+        "ymin": ymin,
+        "ymax": ymax,
+        "width": width,
+        "height": height,
+        "center": [float((xmin + xmax) / 2.0), float((ymin + ymax) / 2.0)],
+        "area_cells": None,
+        "width_cells": None,
+        "height_cells": None,
+        "region_id": region_id,
+        "source": "manual",
+    }
 
 
 def load_open_cells(path: str) -> np.ndarray:
@@ -180,10 +222,6 @@ def rect_grid_to_world(rect: Dict, cell_size: float, min_ix: int, min_iy: int):
     ymin = (left + min_iy) * cell_size
     ymax = (right + 1 + min_iy) * cell_size
 
-    # Note:
-    # grid row index corresponds to x-axis in the original implementation style
-    # grid col index corresponds to y-axis
-
     width = xmax - xmin
     height = ymax - ymin
 
@@ -198,6 +236,7 @@ def rect_grid_to_world(rect: Dict, cell_size: float, min_ix: int, min_iy: int):
         "area_cells": int(rect["area"]),
         "width_cells": int(rect["width_cells"]),
         "height_cells": int(rect["height_cells"]),
+        "source": "auto",
     }
 
 
@@ -234,11 +273,38 @@ def extract_rectangles(
             remove_rectangle_from_mask(work, rect)
             continue
 
-        world_rect["region_id"] = len(rects)
         rects.append(world_rect)
         remove_rectangle_from_mask(work, rect)
 
     return rects, work
+
+
+def build_manual_rects():
+    """
+    Convert MANUAL_OPEN_RECTS into full entries.
+    """
+    manual_rects = []
+    for coords in MANUAL_OPEN_RECTS:
+        if len(coords) != 4:
+            raise ValueError(f"Manual rect must have 4 values, got: {coords}")
+        xmin, xmax, ymin, ymax = coords
+        manual_rects.append(make_manual_rect(xmin, xmax, ymin, ymax))
+    return manual_rects
+
+
+def add_reference_grid(ax, xlim, ylim, spacing=10.0, color="green", alpha=0.35, size=4):
+    """
+    Add green reference dots every `spacing` meters.
+    """
+    xs = np.arange(np.floor(xlim[0] / spacing) * spacing, xlim[1] + spacing, spacing)
+    ys = np.arange(np.floor(ylim[0] / spacing) * spacing, ylim[1] + spacing, spacing)
+
+    gx, gy = np.meshgrid(xs, ys)
+    ax.scatter(
+        gx.ravel(), gy.ravel(),
+        s=size, c=color, alpha=alpha, marker="o", linewidths=0,
+        label="10m ref grid"
+    )
 
 
 def visualize(
@@ -250,16 +316,25 @@ def visualize(
     pcd = np.load(pointcloud_path)
 
     fig, ax = plt.subplots(figsize=(10, 10))
+
+    # reference dots first, so they stay in the background
+    xlim = (pcd[:, 0].min(), pcd[:, 0].max())
+    ylim = (pcd[:, 1].min(), pcd[:, 1].max())
+    add_reference_grid(ax, xlim=xlim, ylim=ylim, spacing=10.0)
+
     ax.scatter(pcd[:, 0], pcd[:, 1], s=0.2, alpha=0.2, color="gray", label="pointcloud")
     ax.scatter(open_cells[:, 0], open_cells[:, 1], s=2, alpha=0.15, color="blue", label="open cells")
 
     for rect in rects:
+        edgecolor = "green" if rect.get("source") == "manual" else "red"
+        textcolor = "darkgreen" if rect.get("source") == "manual" else "darkred"
+
         patch = Rectangle(
             (rect["xmin"], rect["ymin"]),
             rect["width"],
             rect["height"],
             fill=False,
-            edgecolor="red",
+            edgecolor=edgecolor,
             linewidth=2.0,
         )
         ax.add_patch(patch)
@@ -267,13 +342,13 @@ def visualize(
             rect["center"][0],
             rect["center"][1],
             str(rect["region_id"]),
-            color="darkred",
+            color=textcolor,
             fontsize=8,
             ha="center",
             va="center",
         )
 
-    ax.set_title("Open Rectangles (max inner rectangles)")
+    ax.set_title("Open Rectangles (max inner rectangles + manual rects)")
     ax.set_aspect("equal")
     ax.grid(True, alpha=0.2)
     ax.legend(loc="upper right", fontsize=8)
@@ -308,7 +383,7 @@ def main():
     eroded = erode_binary_grid(grid, args.erode_kernel)
     print(f"Eroded with kernel size {args.erode_kernel}")
 
-    rects, remaining = extract_rectangles(
+    auto_rects, remaining = extract_rectangles(
         mask=eroded,
         cell_size=args.cell_size,
         min_ix=min_ix,
@@ -318,6 +393,13 @@ def main():
         min_rect_height=args.min_rect_height,
         max_rects=args.max_rects,
     )
+
+    manual_rects = build_manual_rects()
+
+    # assign region ids after combining
+    rects = auto_rects + manual_rects
+    for i, rect in enumerate(rects):
+        rect["region_id"] = i
 
     with open(args.output_json, "w") as f:
         json.dump(rects, f, indent=2)

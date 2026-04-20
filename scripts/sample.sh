@@ -2,7 +2,7 @@ python -m utils.collect_submission \
   --pointcloud_path pointcloud_2d.npy \
   --initials_path data/eval_initials_20.json \
   --checkpoint_path saved_data/latent_diverse_full_run_v1/controllers/final_controller.pt \
-  --output_dir submission_open_exc_v1 \
+  --output_dir submission_open_subgoal_v1 \
   --gpu 0 \
   --max_steps 300 \
   --success_radius 30.0 \
@@ -43,6 +43,7 @@ python -m utils.collect_submission \
   --open_rects_path open_rects.json \
   --open_excursion_trigger_prob 0.2 \
   --open_excursion_min_target_dist 60.0 \
-  --open_excursion_length 18.0 \
-  --open_excursion_max_steps 12 \
-  --open_excursion_abort_obstacle_dist 3.0
+  --open_excursion_max_steps 50 \
+  --open_excursion_abort_obstacle_dist 3.0 \
+  --open_excursion_subgoal_radius 10.0 \
+  --open_excursion_rect_margin 5.0

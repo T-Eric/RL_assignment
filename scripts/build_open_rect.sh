@@ -1,0 +1,11 @@
+python tools/build_open_rect.py \
+  --open_regions open_regions.json \
+  --pointcloud pointcloud_2d.npy \
+  --output_json open_rects.json \
+  --output_png open_rects.png \
+  --cell_size 2.5 \
+  --erode_kernel 3 \
+  --min_rect_area_cells 80 \
+  --min_rect_width 20 \
+  --min_rect_height 15 \
+  --max_rects 20

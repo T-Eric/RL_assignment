@@ -1,16 +1,16 @@
 python src/train.py \
   --pointcloud_path pointcloud_2d.npy \
   --initials_path data/eval_initials_20.json \
-  --save_dir saved_data/latent_diverse_full_run_v2 \
+  --save_dir saved_data/latent_diverse_full_run_v3 \
   --gpu 0 \
-  --max_iter 40000 \
+  --max_iter 10000 \
   --max_steps 300 \
   --lr 5e-5 \
   --gamma 0.99 \
   --gae_lambda 0.95 \
-  --num_steps 256 \
-  --ppo_epoch 4 \
-  --num_mini_batch 4 \
+  --num_steps 128 \
+  --ppo_epoch 3 \
+  --num_mini_batch 8 \
   --clip_param 0.1 \
   --entropy_coef 0.02 \
   --value_loss_coef 0.5 \
@@ -25,8 +25,8 @@ python src/train.py \
   --visit_bonus 1.0 \
   --cell_repeat_penalty 0.15 \
   --use_history_vis \
-  --global_history_bonus_coef 0.5 \
-  --latent_history_bonus_coef 0.5 \
+  --global_history_bonus_coef 1.5 \
+  --latent_history_bonus_coef 2.5 \
   --use_soft_collision \
   --safe_distance 4.0 \
   --safe_penalty_coef 0.02 \
@@ -47,4 +47,14 @@ python src/train.py \
   --stuck_unique_ratio_threshold 0.35 \
   --escape_open_length 15.0 \
   --escape_open_weight 1.0 \
-  --escape_goal_weight 0.8
+  --escape_goal_weight 0.8 \
+  --num_envs 8 \
+  --history_decay_beta 0.5 \
+  --history_start_relax_radius 45.0 \
+  --history_goal_relax_radius 45.0 \
+  --use_latent_pseudo_goal \
+  --latent_goal_shift_scale 35.0 \
+  --use_inter_latent_repulsion \
+  --inter_latent_repulsion_coef 0.15 \
+  --failure_history_weight 0.08 \
+  --history_pos_weight_cap 1.0 \
