@@ -1,0 +1,48 @@
+python -m utils.collect_submission \
+  --pointcloud_path pointcloud_2d.npy \
+  --initials_path data/eval_initials_20.json \
+  --checkpoint_path saved_data/latent_diverse_full_run_v1/controllers/final_controller.pt \
+  --output_dir submission_open_exc_v1 \
+  --gpu 0 \
+  --max_steps 300 \
+  --success_radius 30.0 \
+  --collision_threshold 2.0 \
+  --action_limit 2.0 \
+  --trajs_per_initial 100 \
+  --max_attempts_per_initial 10000 \
+  --max_fail_save 20 \
+  --num_dirs 16 \
+  --max_obs_range 80.0 \
+  --cell_size 5.0 \
+  --use_episode_vis \
+  --use_history_vis \
+  --visit_bonus 1.0 \
+  --cell_repeat_penalty 0.1 \
+  --global_history_bonus_coef 0.5 \
+  --latent_history_bonus_coef 0.5 \
+  --use_soft_collision \
+  --safe_distance 4.0 \
+  --safe_penalty_coef 0.02 \
+  --use_route_bias \
+  --route_bias_scale 20.0 \
+  --latent_dim 4 \
+  --goal_relax_outer_radius 80.0 \
+  --goal_relax_inner_radius 40.0 \
+  --goal_soft_collision_min_scale 0.25 \
+  --goal_progress_max_scale 1.8 \
+  --use_stuck_escape \
+  --escape_lookahead 12.0 \
+  --stuck_window 12 \
+  --stuck_progress_threshold 6.0 \
+  --stuck_unique_ratio_threshold 0.35 \
+  --escape_open_length 15.0 \
+  --escape_open_weight 1.0 \
+  --escape_goal_weight 0.8 \
+  --num_workers 4 \
+  --use_open_excursion \
+  --open_rects_path open_rects.json \
+  --open_excursion_trigger_prob 0.2 \
+  --open_excursion_min_target_dist 60.0 \
+  --open_excursion_length 18.0 \
+  --open_excursion_max_steps 12 \
+  --open_excursion_abort_obstacle_dist 3.0
