@@ -2,146 +2,186 @@
 Simplified UAV Navigation Environment for RL trajectory collection.
 
 The drone navigates in a 2D plane at fixed altitude (15m) using point cloud
-data as the map. The goal is to reach within 30m of a target building center
-while avoiding collisions with obstacles (point cloud points).
+data as the map. The goal is to reach within success_radius of a target
+building center while avoiding collisions with obstacle points.
 
-Observation: 4D sensor vector
-  - [0:2]: relative offset to nearest obstacle point (dx, dy)
-  - [2:4]: relative offset to target center (dx, dy)
+Observation:
+  sensor = [directional obstacle distances, nearest obstacle rel xy, target rel xy,
+            optional route-biased target rel xy, optional stuck flag + escape dir]
+  latent = one-hot latent vector (optional)
 
-Reward: distance-based progress + success bonus + collision penalty
-
-Action: 2D continuous (dx, dy), each in [-action_limit, action_limit]
+Action:
+  2D continuous displacement (dx, dy), each in [-action_limit, action_limit]
 """
 
-import gym
 import copy
-import torch
+import gym
 import numpy as np
-from .pointcloud_utils import load_pointcloud_transposed, find_nearest_point, build_pointcloud_index, find_nearest_point_kdtree, compute_directional_distances
+import torch
+
+from .pointcloud_utils import (
+    build_pointcloud_index,
+    compute_directional_distances,
+    find_nearest_point_kdtree,
+)
 
 
 class UAVNavEnv(gym.Env):
-
     DEFAULT_PARAMS = {
+        # core task
         "max_steps": 300,
         "success_radius": 30.0,
         "collision_threshold": 2.0,
         "action_limit": [2.0, 2.0],
+
+        # observation
+        "num_dirs": 16,
+        "max_obs_range": 80.0,
+
+        # episode visitation
+        "cell_size": 5.0,
+        "use_episode_vis": False,
+        "visit_bonus": 1.0,
+        "cell_repeat_penalty": 0.0,
+
+        # history visitation
+        "use_history_vis": False,
+        "global_history_bonus_coef": 0.0,
+        "latent_history_bonus_coef": 0.0,
+
+        # position-aware history
+        "history_decay_beta": 0.5,
+        "history_start_relax_radius": 45.0,
+        "history_goal_relax_radius": 45.0,
+        "use_latent_pseudo_goal": True,
+        "latent_goal_shift_scale": 35.0,
+        "use_inter_latent_repulsion": False,
+        "inter_latent_repulsion_coef": 0.0,
+        "failure_history_weight": 0.0,
+        "history_pos_weight_cap": 1.0,
+
+        # initial sampling
+        "initial_success_target": 60.0,
+        "initial_sampling_gamma": 0.8,
+        "zero_success_boost": 1.0,
+
+        # latent
+        "latent_dim": 4,
+
+        # safety
+        "use_soft_collision": False,
+        "safe_distance": 6.0,
+        "safe_penalty_coef": 0.1,
+
+        # near-goal shaping
+        "goal_relax_outer_radius": 80.0,
+        "goal_relax_inner_radius": 40.0,
+        "goal_soft_collision_min_scale": 0.25,
+        "goal_progress_max_scale": 1.8,
+
+        # route bias
+        "use_route_bias": False,
+        "route_bias_scale": 20.0,
+
+        # stuck escape
+        "use_stuck_escape": False,
+        "escape_lookahead": 12.0,
+        "stuck_window": 12,
+        "stuck_progress_threshold": 6.0,
+        "stuck_unique_ratio_threshold": 0.35,
+        "escape_open_length": 15.0,
+        "escape_open_weight": 1.0,
+        "escape_goal_weight": 0.8,
     }
 
-    def __init__(self, pointcloud_path, env_params=None, save_dir=None,
-                 device=None, initials=None):
+    def __init__(self, pointcloud_path, env_params=None, save_dir=None, device=None, initials=None):
         super().__init__()
         params = {**self.DEFAULT_PARAMS, **(env_params or {})}
 
+        # core task
         self.max_steps = params["max_steps"]
         self.success_radius = params["success_radius"]
         self.collision_threshold = params["collision_threshold"]
-        self.action_limit = np.array(params["action_limit"])
+        self.action_limit = np.array(params["action_limit"], dtype=np.float32)
+
+        # infra
         self.device = device or torch.device("cpu")
         self.save_dir = save_dir
-
         self.initials = initials or []
         self.initial_index = 0
         self.success_counts = [0] * max(len(self.initials), 1)
 
-        # observation augmentation
-        self.num_dirs = params.get("num_dirs", 16)
-        self.max_obs_range = params.get("max_obs_range", 80.0)
+        # observation
+        self.num_dirs = params["num_dirs"]
+        self.max_obs_range = params["max_obs_range"]
 
-        # visitation rewards
-        self.cell_size = params.get("cell_size", 5.0)
+        # episode visitation
+        self.cell_size = params["cell_size"]
+        self.use_episode_vis = params["use_episode_vis"]
+        self.visit_bonus = params["visit_bonus"]
+        self.cell_repeat_penalty = params["cell_repeat_penalty"]
 
-        self.use_episode_vis = params.get("use_episode_vis", False)
-        self.use_history_vis = params.get("use_history_vis", False)
+        # history visitation
+        self.use_history_vis = params["use_history_vis"]
+        self.global_history_bonus_coef = params["global_history_bonus_coef"]
+        self.latent_history_bonus_coef = params["latent_history_bonus_coef"]
 
-        self.visit_bonus = params.get("visit_bonus", 1.0)
-        self.cell_repeat_penalty = params.get("cell_repeat_penalty", 0.0)
-        # self.history_bonus_coef=params.get("history_bonus_coef", 0.0)
-        self.global_history_bonus_coef = params.get(
-            "global_history_bonus_coef", 0.0)
-        self.latent_history_bonus_coef = params.get(
-            "latent_history_bonus_coef", 0.0)
-        
-        # --------------------------------------------------
-        # position-aware history weighting
-        # --------------------------------------------------
-        self.history_decay_beta = params.get("history_decay_beta", 0.5)
+        # position-aware history
+        self.history_decay_beta = params["history_decay_beta"]
+        self.history_start_relax_radius = params["history_start_relax_radius"]
+        self.history_goal_relax_radius = params["history_goal_relax_radius"]
+        self.use_latent_pseudo_goal = params["use_latent_pseudo_goal"]
+        self.latent_goal_shift_scale = params["latent_goal_shift_scale"]
+        self.use_inter_latent_repulsion = params["use_inter_latent_repulsion"]
+        self.inter_latent_repulsion_coef = params["inter_latent_repulsion_coef"]
+        self.failure_history_weight = params["failure_history_weight"]
+        self.history_pos_weight_cap = params["history_pos_weight_cap"]
 
-        # distance-based suppression near start / goal
-        self.history_start_relax_radius = params.get("history_start_relax_radius", 45.0)
-        self.history_goal_relax_radius = params.get("history_goal_relax_radius", 45.0)
+        # initial sampling
+        self.initial_success_target = params["initial_success_target"]
+        self.initial_sampling_gamma = params["initial_sampling_gamma"]
+        self.zero_success_boost = params["zero_success_boost"]
 
-        # whether to use latent pseudo goal for latent-specific history weighting
-        self.use_latent_pseudo_goal = params.get("use_latent_pseudo_goal", True)
-        self.latent_goal_shift_scale = params.get("latent_goal_shift_scale", 35.0)
-
-        # inter-latent overlap repulsion
-        self.use_inter_latent_repulsion = params.get("use_inter_latent_repulsion", False)
-        self.inter_latent_repulsion_coef = params.get("inter_latent_repulsion_coef", 0.0)
-
-        # failure trajectory weighted history update
-        self.failure_history_weight = params.get("failure_history_weight", 0.0)
-
-        # optional cap for position weight (normally 1.0)
-        self.history_pos_weight_cap = params.get("history_pos_weight_cap", 1.0)
-
-        # latent z
-        self.latent_dim = params.get("latent_dim", 4)
+        # latent
+        self.latent_dim = params["latent_dim"]
         self.curr_latent = None
 
-        # soft collision / safety shaping
-        self.use_soft_collision = params.get("use_soft_collision", False)
-        self.safe_distance = params.get("safe_distance", 6.0)
-        self.safe_penalty_coef = params.get("safe_penalty_coef", 0.1)
-        
-        # goal-proximity relaxation / amplification
-        self.goal_relax_outer_radius = params.get("goal_relax_outer_radius", 80.0)
-        self.goal_relax_inner_radius = params.get("goal_relax_inner_radius", 40.0)
+        # safety
+        self.use_soft_collision = params["use_soft_collision"]
+        self.safe_distance = params["safe_distance"]
+        self.safe_penalty_coef = params["safe_penalty_coef"]
 
-        # near goal, keep only this fraction of soft collision penalty
-        self.goal_soft_collision_min_scale = params.get(
-            "goal_soft_collision_min_scale", 0.25
-        )
+        # near-goal shaping
+        self.goal_relax_outer_radius = params["goal_relax_outer_radius"]
+        self.goal_relax_inner_radius = params["goal_relax_inner_radius"]
+        self.goal_soft_collision_min_scale = params["goal_soft_collision_min_scale"]
+        self.goal_progress_max_scale = params["goal_progress_max_scale"]
 
-        # near goal, multiply progress reward by this factor
-        self.goal_progress_max_scale = params.get(
-            "goal_progress_max_scale", 1.8
-        )
-        
-        # latent-wise route bias
-        self.use_route_bias = params.get("use_route_bias", False)
-        self.route_bias_scale = params.get("route_bias_scale", 20.0) # goal bias
+        # route bias
+        self.use_route_bias = params["use_route_bias"]
+        self.route_bias_scale = params["route_bias_scale"]
         self.route_bias_table = self._build_route_bias_table()
-        
-        # stuck-aware escape destination
-        self.use_stuck_escape = params.get("use_stuck_escape", False)
-        self.escape_lookahead = params.get("escape_lookahead", 12.0)
-        
-        # stuck detection
-        self.stuck_window = params.get("stuck_window", 12)
-        self.stuck_progress_threshold = params.get("stuck_progress_threshold", 6.0)
-        self.stuck_unique_ratio_threshold = params.get("stuck_unique_ratio_threshold", 0.35)
 
-        # escape direction scoring
-        self.escape_open_length = params.get("escape_open_length", 15.0)
-        self.escape_open_weight = params.get("escape_open_weight", 1.0)
-        self.escape_goal_weight = params.get("escape_goal_weight", 0.8)
+        # stuck escape
+        self.use_stuck_escape = params["use_stuck_escape"]
+        self.escape_lookahead = params["escape_lookahead"]
+        self.stuck_window = params["stuck_window"]
+        self.stuck_progress_threshold = params["stuck_progress_threshold"]
+        self.stuck_unique_ratio_threshold = params["stuck_unique_ratio_threshold"]
+        self.escape_open_length = params["escape_open_length"]
+        self.escape_open_weight = params["escape_open_weight"]
+        self.escape_goal_weight = params["escape_goal_weight"]
 
-        # Load point cloud: (2, N)
         print(f"Loading point cloud from {pointcloud_path}...")
-        # self.all_points = load_pointcloud_transposed(pointcloud_path)
-        self.all_points, self.kd_tree = build_pointcloud_index(
-            npy_path=pointcloud_path)
+        self.all_points, self.kd_tree = build_pointcloud_index(npy_path=pointcloud_path)
         print(f"Loaded {self.all_points.shape[0]} points")
 
-        # obs shape: +latent
-        base_sensor_dim = self.num_dirs + 4
+        # observation shape
+        base_sensor_dim = self.num_dirs + 4  # directional_dists + nearest_obs_rel + target_rel
+
         if self.use_route_bias and self.latent_dim > 0:
             base_sensor_dim += 2
-            
-        # stuck escape
+
         if self.use_stuck_escape:
             base_sensor_dim += 3  # stuck flag + escape dir (2D)
 
@@ -154,22 +194,23 @@ class UAVNavEnv(gym.Env):
             self.observation_shape = {
                 "sensor": (base_sensor_dim,),
             }
+
         self.action_shape = (2,)
 
+        # runtime state
         self.curr_pose = None
         self.target_center = None
         self.step_count = 0
-
-        # visitation conditions
         self.curr_initial_id = None
+
         self.visited_cells_ep = set()
-        
-        # global per-initial coverage
+        self._ep_rewarded_cells = set()
+
+        # per-initial coverage
         self.global_coverage_maps = {
             init["initial_id"]: {} for init in self.initials
         }
 
-        # latent-specific per-initial coverage
         if self.latent_dim > 0:
             self.latent_coverage_maps = {
                 init["initial_id"]: {
@@ -188,46 +229,53 @@ class UAVNavEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def reset(self, initial_pose, target_center, initial_id=None, latent=None):
-        """
-        Reset environment for a new episode.
-
-        Args:
-            initial_pose: np.array [x, y, 0.0]
-            target_center: np.array [cx, cy] — target building center
-        """
         self.curr_pose = np.array(initial_pose, dtype=np.float64)
         self.target_center = np.array(target_center, dtype=np.float64)
-        self.step_count = 0
-        self.episode_reward = 0.0
-        self.initial_pose = initial_pose.copy()
-        self._prev_target_dist = None
-
-        # visitation condition reset
+        self.initial_pose = np.array(initial_pose, dtype=np.float64)
         self.curr_initial_id = initial_id
         self.curr_latent = latent
-        self.visited_cells_ep = set()
 
-        # episode summary stats
+        self.step_count = 0
+        self.episode_reward = 0.0
+        self._prev_target_dist = None
+
+        # episode visitation
+        self.visited_cells_ep = set()
+        self._ep_rewarded_cells = set()
+
+        start_xy = np.array([self.initial_pose[0], self.initial_pose[1]], dtype=np.float64)
+        start_cell = self._xy_to_cell(start_xy)
+        self.visited_cells_ep.add(start_cell)
+        self._ep_rewarded_cells.add(start_cell)
+
+        # summary stats
         self.path_length = 0.0
         self.turn_sum = 0.0
         self.prev_heading = None
 
-        # history buffer for stuck detection
+        # stuck-history buffer
         self.recent_positions = []
         self.recent_target_dists = []
         self.recent_cells = []
 
-        start_xy = np.array([initial_pose[0], initial_pose[1]], dtype=np.float64)
-        start_cell = self._xy_to_cell(start_xy)
-        self.visited_cells_ep.add(start_cell)  # not to reward on start cell
+        # diagnostics
+        self.min_goal_dist = float(np.linalg.norm(self.target_center - start_xy))
+        self.min_obstacle_dist = float("inf")
+
+        # reward decomposition accumulators
+        self.progress_reward_sum = 0.0
+        self.success_bonus_sum = 0.0
+        self.collision_penalty_sum = 0.0
+        self.step_penalty_sum = 0.0
+        self.soft_collision_penalty_sum = 0.0
+        self.visit_reward_sum = 0.0
+        self.history_reward_sum = 0.0
+        self.inter_latent_repulsion_sum = 0.0
 
         obs = self._get_obs()
 
-        # IMPORTANT:
-        # _prev_target_dist must always be based on the true goal, not the possibly
-        # replaced observation target when stuck-escape is enabled.
+        # IMPORTANT: true-goal distance only
         self._prev_target_dist = np.linalg.norm(self.target_center - start_xy)
-
         return obs
 
     def step(self, action):
@@ -238,30 +286,33 @@ class UAVNavEnv(gym.Env):
         step_len = float(np.sqrt(dx * dx + dy * dy))
         curr_heading = float(np.arctan2(dy, dx))
 
-        self.curr_pose = np.array([x + dx, y + dy, curr_heading])
+        self.curr_pose = np.array([x + dx, y + dy, curr_heading], dtype=np.float64)
         curr_xy = np.array([self.curr_pose[0], self.curr_pose[1]], dtype=np.float64)
         curr_cell = self._xy_to_cell(curr_xy)
 
-        # summary stats update
+        # summary stats
         self.path_length += step_len
         if self.prev_heading is not None:
             dtheta = curr_heading - self.prev_heading
-            dtheta = (dtheta + np.pi) % (2 * np.pi) - np.pi  # wrap to [-pi, pi]
+            dtheta = (dtheta + np.pi) % (2 * np.pi) - np.pi
             self.turn_sum += abs(dtheta)
         self.prev_heading = curr_heading
 
-        # build obs AFTER state update
+        # keep full visited set regardless of whether episode-vis reward is enabled
+        self.visited_cells_ep.add(curr_cell)
+
+        # build obs after state update
         obs = self._get_obs()
         sensor = obs["sensor"].cpu().numpy()
 
-        dir_dists = sensor[:self.num_dirs]
         nearest_obs_rel = sensor[self.num_dirs:self.num_dirs + 2]
-        obstacle_dist = np.linalg.norm(nearest_obs_rel)
+        obstacle_dist = float(np.linalg.norm(nearest_obs_rel))
 
-        # IMPORTANT:
-        # reward/success must use the TRUE goal, not observation target
         true_target_rel = self.target_center - curr_xy
-        target_dist = np.linalg.norm(true_target_rel)
+        target_dist = float(np.linalg.norm(true_target_rel))
+
+        self.min_goal_dist = min(self.min_goal_dist, target_dist)
+        self.min_obstacle_dist = min(self.min_obstacle_dist, obstacle_dist)
 
         # update history buffers for stuck detection
         self.recent_positions.append(curr_xy.copy())
@@ -273,29 +324,42 @@ class UAVNavEnv(gym.Env):
             self.recent_target_dists.pop(0)
             self.recent_cells.pop(0)
 
-        # --- Check termination conditions ---
+        # ------------------------------------------------------------------
+        # termination
+        # ------------------------------------------------------------------
         done = False
         info = {}
 
-        # Collision
         if obstacle_dist <= self.collision_threshold:
             done = True
             info["won"] = False
+            info["term_type"] = "collision"
 
-        # Success
         if target_dist <= self.success_radius:
             done = True
             info["won"] = True
+            info["term_type"] = "success"
 
         self.step_count += 1
         if self.step_count >= self.max_steps and not done:
             done = True
             info["won"] = False
+            info["term_type"] = "timeout"
 
-        # --- Reward computation ---
+        # ------------------------------------------------------------------
+        # reward decomposition
+        # ------------------------------------------------------------------
         reward = 0.0
 
-        # Progress toward TRUE target
+        progress_reward = 0.0
+        collision_penalty = 0.0
+        success_bonus = 0.0
+        step_penalty = -0.5
+        soft_collision_penalty = 0.0
+        visit_reward = 0.0
+        history_reward = 0.0
+        inter_latent_repulsion = 0.0
+
         progress_scale = self._goal_proximity_scale(
             target_dist=target_dist,
             outer_radius=self.goal_relax_outer_radius,
@@ -303,22 +367,20 @@ class UAVNavEnv(gym.Env):
             near_value=self.goal_progress_max_scale,
             far_value=1.0,
         )
-
         if self._prev_target_dist is not None:
-            reward += progress_scale * (self._prev_target_dist - target_dist)
+            progress_reward = progress_scale * (self._prev_target_dist - target_dist)
 
-        # Collision penalty
         if obstacle_dist <= self.collision_threshold:
-            reward -= 100.0
+            collision_penalty = -100.0
 
-        # Success bonus
         if info.get("won", False):
-            reward += 200.0
+            success_bonus = 200.0
 
-        # Step penalty
-        reward -= 0.5
+        reward += progress_reward
+        reward += collision_penalty
+        reward += success_bonus
+        reward += step_penalty
 
-        # soft collision / safety shaping
         safe_scale = self._goal_proximity_scale(
             target_dist=target_dist,
             outer_radius=self.goal_relax_outer_radius,
@@ -326,75 +388,82 @@ class UAVNavEnv(gym.Env):
             near_value=self.goal_soft_collision_min_scale,
             far_value=1.0,
         )
-
         if self.use_soft_collision and obstacle_dist < self.safe_distance:
-            reward -= (
+            soft_collision_penalty = -(
                 safe_scale
                 * self.safe_penalty_coef
                 * (self.safe_distance - obstacle_dist) ** 2
             )
+            reward += soft_collision_penalty
 
-        # visitation rewards
-        visit_reward = 0.0
+        # episode-level anti-loop reward
         if self.use_episode_vis:
-            if curr_cell not in self.visited_cells_ep:
+            if curr_cell not in self._ep_rewarded_cells:
                 visit_reward += self.visit_bonus
-                self.visited_cells_ep.add(curr_cell)
+                self._ep_rewarded_cells.add(curr_cell)
             else:
                 visit_reward -= self.cell_repeat_penalty
 
-        # historical coverage reward
-        history_reward = 0.0
+        # history visitation reward
         if self.use_history_vis and self.curr_initial_id is not None:
             latent_id = self._get_latent_id()
 
-            # ---------- global per-initial history ----------
+            # global history
             global_map = self.global_coverage_maps[self.curr_initial_id]
             global_count = global_map.get(curr_cell, 0.0)
-            w_global = self._compute_history_position_weight(
-                curr_cell, use_latent_goal=False
-            )
+            w_global = self._compute_history_position_weight(curr_cell, use_latent_goal=False)
             history_reward += (
                 w_global
                 * self.global_history_bonus_coef
                 * self._history_novelty(global_count)
             )
 
-            # ---------- latent-specific per-initial history ----------
+            # latent-specific history
             if latent_id is not None:
                 latent_map = self.latent_coverage_maps[self.curr_initial_id][latent_id]
                 latent_count = latent_map.get(curr_cell, 0.0)
-                w_latent = self._compute_history_position_weight(
-                    curr_cell, use_latent_goal=True
-                )
+                w_latent = self._compute_history_position_weight(curr_cell, use_latent_goal=True)
                 history_reward += (
                     w_latent
                     * self.latent_history_bonus_coef
                     * self._history_novelty(latent_count)
                 )
 
-                # ---------- inter-latent repulsion ----------
+                # inter-latent repulsion
                 if self.use_inter_latent_repulsion and self.inter_latent_repulsion_coef > 0.0:
                     other_latent_count = self._get_other_latent_overlap_count(
                         self.curr_initial_id, curr_cell, latent_id
                     )
-                    history_reward -= (
+                    inter_latent_repulsion = -(
                         w_latent
                         * self.inter_latent_repulsion_coef
                         * np.log(1.0 + other_latent_count)
                     )
 
-        self._prev_target_dist = target_dist
+        reward += visit_reward
+        reward += history_reward
+        reward += inter_latent_repulsion
 
-        reward += visit_reward + history_reward
+        self._prev_target_dist = target_dist
         self.episode_reward += reward
 
+        # accumulate diagnostics
+        self.progress_reward_sum += float(progress_reward)
+        self.success_bonus_sum += float(success_bonus)
+        self.collision_penalty_sum += float(collision_penalty)
+        self.step_penalty_sum += float(step_penalty)
+        self.soft_collision_penalty_sum += float(soft_collision_penalty)
+        self.visit_reward_sum += float(visit_reward)
+        self.history_reward_sum += float(history_reward)
+        self.inter_latent_repulsion_sum += float(inter_latent_repulsion)
+
         if done:
-            info["episode"] = {"r": self.episode_reward}
+            info["episode"] = {"r": float(self.episode_reward)}
             info["initial_pose"] = copy.deepcopy(self.initial_pose)
             info["target_center"] = copy.deepcopy(self.target_center)
+            info["initial_id"] = self.curr_initial_id
 
-            # episode summary stats
+            # episode summary features for latent discriminator
             final_xy = np.array([self.curr_pose[0], self.curr_pose[1]], dtype=np.float64)
             start_xy = np.array([self.initial_pose[0], self.initial_pose[1]], dtype=np.float64)
             target_xy = np.array([self.target_center[0], self.target_center[1]], dtype=np.float64)
@@ -416,35 +485,37 @@ class UAVNavEnv(gym.Env):
                 self.turn_sum / np.pi,
                 visited_count / 100.0,
             ], dtype=np.float32)
-
             info["episode_summary"] = summary
 
             if self.curr_latent is not None:
                 info["latent_id"] = int(np.argmax(self.curr_latent))
 
-            # if info.get("won", False):
-            #     # 1) update global per-initial map
-            #     global_map = self.global_coverage_maps[self.curr_initial_id]
-            #     for cell in self.visited_cells_ep:
-            #         global_map[cell] = global_map.get(cell, 0) + 1
+            # detailed diagnostics
+            info["final_goal_dist"] = float(target_dist)
+            info["min_goal_dist"] = float(self.min_goal_dist)
+            info["final_obstacle_dist"] = float(obstacle_dist)
+            info["min_obstacle_dist"] = float(self.min_obstacle_dist)
+            info["episode_len"] = int(self.step_count)
 
-            #     # 2) update latent-specific per-initial map
-            #     if self.curr_latent is not None:
-            #         latent_id = int(np.argmax(self.curr_latent))
-            #         latent_map = self.latent_coverage_maps[self.curr_initial_id][latent_id]
-            #         for cell in self.visited_cells_ep:
-            #             latent_map[cell] = latent_map.get(cell, 0) + 1
-            
-            # TODO CAUTION! Now failure trajs also count
+            info["reward_breakdown"] = {
+                "progress": float(self.progress_reward_sum),
+                "success_bonus": float(self.success_bonus_sum),
+                "collision_penalty": float(self.collision_penalty_sum),
+                "step_penalty": float(self.step_penalty_sum),
+                "soft_collision_penalty": float(self.soft_collision_penalty_sum),
+                "visit_reward": float(self.visit_reward_sum),
+                "history_reward": float(self.history_reward_sum),
+                "inter_latent_repulsion": float(self.inter_latent_repulsion_sum),
+            }
+
+            # update history maps
             update_weight = 1.0 if info.get("won", False) else self.failure_history_weight
 
             if update_weight > 0.0 and self.curr_initial_id is not None:
-                # 1) update global per-initial map
                 global_map = self.global_coverage_maps[self.curr_initial_id]
                 for cell in self.visited_cells_ep:
                     global_map[cell] = global_map.get(cell, 0.0) + update_weight
 
-                # 2) update latent-specific per-initial map
                 latent_id = self._get_latent_id()
                 if latent_id is not None:
                     latent_map = self.latent_coverage_maps[self.curr_initial_id][latent_id]
@@ -452,7 +523,6 @@ class UAVNavEnv(gym.Env):
                         latent_map[cell] = latent_map.get(cell, 0.0) + update_weight
 
         return obs, torch.tensor([reward], device=self.device), [done], [info]
-
 
     # ------------------------------------------------------------------
     # Observation
@@ -473,7 +543,6 @@ class UAVNavEnv(gym.Env):
             max_range=self.max_obs_range,
         )
 
-        # default: normal navigation target
         obs_target_rel = true_target_rel.astype(np.float32)
 
         # stuck-aware escape target
@@ -487,14 +556,11 @@ class UAVNavEnv(gym.Env):
                 directional_dists=directional_dists,
                 target_rel=true_target_rel,
             )
-            
-            # robust fallback
             if escape_dir is None:
                 escape_dir = np.array([0.0, 0.0], dtype=np.float32)
             else:
                 escape_dir = np.asarray(escape_dir, dtype=np.float32)
 
-            # replace observation target with a local escape destination
             escape_target = xy + self.escape_lookahead * escape_dir
             obs_target_rel = (escape_target - xy).astype(np.float32)
             used_escape_target = True
@@ -505,22 +571,15 @@ class UAVNavEnv(gym.Env):
             obs_target_rel.astype(np.float32),
         ]
 
-        # route bias: disabled while stuck / using escape target
         if self.use_route_bias and self.latent_dim > 0:
             if not used_escape_target:
-                if self.curr_latent is None:
-                    latent_id = 0
-                else:
-                    latent_id = int(np.argmax(self.curr_latent))
-
+                latent_id = 0 if self.curr_latent is None else int(np.argmax(self.curr_latent))
                 bias_dir = self.route_bias_table[latent_id]
                 biased_target_rel = obs_target_rel + self.route_bias_scale * bias_dir
                 parts.append(biased_target_rel.astype(np.float32))
             else:
-                # keep dimension unchanged, but disable latent route bias while stuck
                 parts.append(obs_target_rel.astype(np.float32))
 
-        # append stuck-aware auxiliary info
         if self.use_stuck_escape:
             parts.append(np.array([stuck_flag], dtype=np.float32))
             parts.append(escape_dir.astype(np.float32))
@@ -541,7 +600,7 @@ class UAVNavEnv(gym.Env):
         return obs
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Sampling / utilities
     # ------------------------------------------------------------------
 
     def _sample_next_initial(self, was_success):
@@ -549,39 +608,34 @@ class UAVNavEnv(gym.Env):
             self.success_counts[self.initial_index] += 1
 
         success_counts = np.array(self.success_counts, dtype=np.float32)
-
-        # ---- 1. 已完成 initial 直接退出训练池 ----
-        mask = success_counts < 300.0   # 事不过三
+        mask = success_counts < self.initial_success_target
 
         if not np.any(mask):
-            # fallback：全部完成，随便选（理论上不会发生）
             self.initial_index = np.random.randint(len(self.initials))
             return
 
-        # ---- 2. 用幂函数代替 log（更激进）----
-        gamma = 0.6   # 核心参数，可调 0.6 ~ 1.0
-
-        weights = np.zeros_like(success_counts)
+        gamma = self.initial_sampling_gamma
+        weights = np.zeros_like(success_counts, dtype=np.float32)
         weights[mask] = 1.0 / ((success_counts[mask] + 1.0) ** gamma)
 
-        # 防止全 0
-        if weights.sum() <= 1e-6:
+        if self.zero_success_boost > 1.0:
+            zero_mask = (success_counts == 0.0) & mask
+            weights[zero_mask] *= self.zero_success_boost
+
+        weight_sum = weights.sum()
+        if weight_sum <= 1e-8:
             weights[mask] = 1.0
+            weight_sum = weights.sum()
 
-        probs = weights / weights.sum()
+        probs = weights / weight_sum
+        self.initial_index = int(np.random.choice(len(self.initials), p=probs))
 
-        self.initial_index = np.random.choice(len(self.initials), p=probs)
-
-    # ------------------------------------------------------------------
-    # Visitation tracking
-    # ------------------------------------------------------------------
     def _xy_to_cell(self, xy):
         x, y = xy
         cx = int(np.floor(x / self.cell_size))
         cy = int(np.floor(y / self.cell_size))
         return (cx, cy)
 
-    # uniformly distributed bias directions
     def _build_route_bias_table(self):
         if self.latent_dim <= 0:
             return None
@@ -593,33 +647,27 @@ class UAVNavEnv(gym.Env):
             table[z, 1] = np.sin(theta)
         return table
 
-    # scale reward when near the goal to encourage final approach
     def _goal_proximity_scale(self, target_dist, outer_radius, inner_radius, near_value, far_value):
         if target_dist >= outer_radius:
             return far_value
         if target_dist <= inner_radius:
             return near_value
 
-        # linear interpolation
         ratio = (target_dist - inner_radius) / (outer_radius - inner_radius)
         return near_value + (far_value - near_value) * ratio
-    
-    # wandering detection based on recent trajectory history
+
     def _check_stuck(self):
         if len(self.recent_positions) < self.stuck_window:
             return False
 
-        # condition 1: weak progress
         progress = self.recent_target_dists[0] - self.recent_target_dists[-1]
         cond_progress = progress < self.stuck_progress_threshold
 
-        # condition 2: low unique-cell ratio
         unique_ratio = len(set(self.recent_cells)) / float(self.stuck_window)
         cond_cells = unique_ratio < self.stuck_unique_ratio_threshold
 
         return cond_progress and cond_cells
-    
-    # help escape
+
     def _compute_escape_direction(self, directional_dists, target_rel):
         num_dirs = len(directional_dists)
 
@@ -638,7 +686,6 @@ class UAVNavEnv(gym.Env):
 
             d_k = directional_dists[k]
             open_score = min(d_k / self.escape_open_length, 1.0)
-
             goal_align = float(np.dot(goal_dir, u))
 
             score = (
@@ -651,10 +698,11 @@ class UAVNavEnv(gym.Env):
                 best_vec = u
 
         return best_vec
-    
-    # ------
-    # dynamic history utils
-    # ------
+
+    # ------------------------------------------------------------------
+    # History helpers
+    # ------------------------------------------------------------------
+
     def _cell_to_center_xy(self, cell):
         cx, cy = cell
         x = (cx + 0.5) * self.cell_size
@@ -667,9 +715,6 @@ class UAVNavEnv(gym.Env):
         return int(np.argmax(self.curr_latent))
 
     def _get_latent_pseudo_goal(self):
-        """
-        Build a pseudo goal for latent-conditioned mid-route weighting.
-        """
         if (not self.use_latent_pseudo_goal) or (self.curr_latent is None) or (self.route_bias_table is None):
             return self.target_center
 
@@ -678,9 +723,6 @@ class UAVNavEnv(gym.Env):
         return self.target_center + self.latent_goal_shift_scale * bias_dir
 
     def _compute_history_position_weight(self, cell, use_latent_goal=False):
-        """
-        Larger in the middle of the route, smaller near start / goal.
-        """
         cell_xy = self._cell_to_center_xy(cell)
         start_xy = np.array([self.initial_pose[0], self.initial_pose[1]], dtype=np.float64)
 
@@ -700,15 +742,9 @@ class UAVNavEnv(gym.Env):
         return float(w)
 
     def _history_novelty(self, count):
-        """
-        Decaying novelty reward.
-        """
         return 1.0 / ((1.0 + count) ** self.history_decay_beta)
 
     def _get_other_latent_overlap_count(self, initial_id, cell, curr_latent_id):
-        """
-        Sum of successful visitation counts from other latents on this cell.
-        """
         if self.latent_dim <= 0 or curr_latent_id is None:
             return 0.0
 

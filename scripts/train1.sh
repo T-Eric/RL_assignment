@@ -1,9 +1,9 @@
 python src/train.py \
   --pointcloud_path pointcloud_2d.npy \
   --initials_path data/eval_initials_20.json \
-  --save_dir saved_data/curriculum_phase1_nav \
+  --save_dir saved_data/curriculum_phase1_nav_v2 \
   --gpu 0 \
-  --max_iter 3000 \
+  --max_iter 10000 \
   --max_steps 450 \
   --lr 5e-5 \
   --gamma 0.99 \
@@ -12,34 +12,31 @@ python src/train.py \
   --ppo_epoch 3 \
   --num_mini_batch 8 \
   --clip_param 0.1 \
-  --entropy_coef 0.02 \
+  --entropy_coef 0.015 \
   --value_loss_coef 0.5 \
   --max_grad_norm 0.5 \
   --seed 1 \
   --log_interval 10 \
-  --save_interval 500 \
+  --save_interval 1000 \
   --num_dirs 16 \
   --max_obs_range 80.0 \
   --cell_size 5.0 \
   --use_episode_vis \
-  --visit_bonus 1.0 \
+  --visit_bonus 0.5 \
   --cell_repeat_penalty 0.1 \
-  --use_history_vis \
-  --global_history_bonus_coef 0.3 \
-  --latent_history_bonus_coef 0.5 \
   --use_soft_collision \
-  --safe_distance 4.0 \
-  --safe_penalty_coef 0.02 \
+  --safe_distance 4.5 \
+  --safe_penalty_coef 0.03 \
   --use_route_bias \
-  --route_bias_scale 20.0 \
+  --route_bias_scale 15.0 \
   --latent_dim 4 \
-  --disc_bonus_coef 1.0 \
+  --disc_bonus_coef 0.0 \
   --disc_loss_coef 1.0 \
   --disc_lr 1e-4 \
   --goal_relax_outer_radius 80.0 \
   --goal_relax_inner_radius 40.0 \
-  --goal_soft_collision_min_scale 0.25 \
-  --goal_progress_max_scale 1.8 \
+  --goal_soft_collision_min_scale 0.15 \
+  --goal_progress_max_scale 2.2 \
   --use_stuck_escape \
   --escape_lookahead 12.0 \
   --stuck_window 12 \
@@ -47,12 +44,5 @@ python src/train.py \
   --stuck_unique_ratio_threshold 0.35 \
   --escape_open_length 15.0 \
   --escape_open_weight 1.0 \
-  --escape_goal_weight 0.8 \
-  --num_envs 8 \
-  --history_decay_beta 0.5 \
-  --history_start_relax_radius 45.0 \
-  --history_goal_relax_radius 45.0 \
-  --use_latent_pseudo_goal \
-  --latent_goal_shift_scale 35.0 \
-  --failure_history_weight 0.0 \
-  --history_pos_weight_cap 1.0
+  --escape_goal_weight 1.0 \
+  --num_envs 8
