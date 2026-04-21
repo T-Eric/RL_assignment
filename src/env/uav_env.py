@@ -548,8 +548,28 @@ class UAVNavEnv(gym.Env):
         if was_success:
             self.success_counts[self.initial_index] += 1
 
-        probs = 1.0 / (np.log(np.array(self.success_counts) + 2))
-        probs = probs / probs.sum()
+        success_counts = np.array(self.success_counts, dtype=np.float32)
+
+        # ---- 1. 已完成 initial 直接退出训练池 ----
+        mask = success_counts < 300.0   # 事不过三
+
+        if not np.any(mask):
+            # fallback：全部完成，随便选（理论上不会发生）
+            self.initial_index = np.random.randint(len(self.initials))
+            return
+
+        # ---- 2. 用幂函数代替 log（更激进）----
+        gamma = 0.6   # 核心参数，可调 0.6 ~ 1.0
+
+        weights = np.zeros_like(success_counts)
+        weights[mask] = 1.0 / ((success_counts[mask] + 1.0) ** gamma)
+
+        # 防止全 0
+        if weights.sum() <= 1e-6:
+            weights[mask] = 1.0
+
+        probs = weights / weights.sum()
+
         self.initial_index = np.random.choice(len(self.initials), p=probs)
 
     # ------------------------------------------------------------------

@@ -1,12 +1,11 @@
 python src/train.py \
   --pointcloud_path pointcloud_2d.npy \
   --initials_path data/eval_initials_20.json \
-  --save_dir saved_data/curriculum_phase2_diverse \
-  --resume_checkpoint saved_data/curriculum_phase1_nav/controllers/final_controller.pt \
+  --save_dir saved_data/curriculum_phase1_nav \
   --gpu 0 \
-  --max_iter 7000 \
+  --max_iter 3000 \
   --max_steps 450 \
-  --lr 3e-5 \
+  --lr 5e-5 \
   --gamma 0.99 \
   --gae_lambda 0.95 \
   --num_steps 128 \
@@ -24,17 +23,17 @@ python src/train.py \
   --cell_size 5.0 \
   --use_episode_vis \
   --visit_bonus 1.0 \
-  --cell_repeat_penalty 0.15 \
+  --cell_repeat_penalty 0.1 \
   --use_history_vis \
-  --global_history_bonus_coef 1.5 \
-  --latent_history_bonus_coef 2.5 \
+  --global_history_bonus_coef 0.3 \
+  --latent_history_bonus_coef 0.5 \
   --use_soft_collision \
   --safe_distance 4.0 \
   --safe_penalty_coef 0.02 \
   --use_route_bias \
   --route_bias_scale 20.0 \
   --latent_dim 4 \
-  --disc_bonus_coef 5.0 \
+  --disc_bonus_coef 1.0 \
   --disc_loss_coef 1.0 \
   --disc_lr 1e-4 \
   --goal_relax_outer_radius 80.0 \
@@ -55,7 +54,5 @@ python src/train.py \
   --history_goal_relax_radius 45.0 \
   --use_latent_pseudo_goal \
   --latent_goal_shift_scale 35.0 \
-  --use_inter_latent_repulsion \
-  --inter_latent_repulsion_coef 0.15 \
-  --failure_history_weight 0.02 \
+  --failure_history_weight 0.0 \
   --history_pos_weight_cap 1.0

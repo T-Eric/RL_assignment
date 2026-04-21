@@ -104,6 +104,8 @@ def parse_args():
     parser.add_argument("--escape_open_length", type=float, default=15.0)
     parser.add_argument("--escape_open_weight", type=float, default=1.0)
     parser.add_argument("--escape_goal_weight", type=float, default=0.8)
+    
+    parser.add_argument("--resume_checkpoint", type=str, default=None)
     return parser.parse_args()
 
 
@@ -272,6 +274,11 @@ def main():
         action_dim=2,
         action_limit=(2.0, 2.0),
     ).to(device)
+    
+    if args.resume_checkpoint is not None:
+        print(f"Loading checkpoint from {args.resume_checkpoint}")
+        state_dict = torch.load(args.resume_checkpoint, map_location=device)
+        actor_critic.load_state_dict(state_dict, strict=True)
 
     disc = None
     disc_optimizer = None
@@ -465,12 +472,14 @@ def main():
         if j % args.log_interval == 0 and len(episode_rewards) > 0:
             elapsed = time.time() - start_time
             total_steps = (j + 1) * args.num_steps * args.num_envs
+            
+            curr_success_count=success_counter+len(pending_success_trajs)
 
             log_msg = (
                 f"[Iter {j:6d}] "
                 f"steps={total_steps:9d}  "
                 f"reward={np.mean(episode_rewards):7.1f}  "
-                f"success_trajs={success_counter:6d}  "
+                f"success_trajs={curr_success_count:6d}  "
                 f"v_loss={value_loss:.4f}  "
                 f"entropy={dist_entropy:.4f}  "
                 f"elapsed={elapsed:.0f}s"
@@ -482,7 +491,7 @@ def main():
 
             with open(os.path.join(args.save_dir, "train_log.txt"), "a") as f:
                 f.write(
-                    f"{j}\t{np.mean(episode_rewards):.4f}\t{success_counter}\t"
+                    f"{j}\t{np.mean(episode_rewards):.4f}\t{curr_success_count}\t"
                     f"{value_loss:.6f}\t{dist_entropy:.6f}\n"
                 )
 
